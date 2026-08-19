@@ -30,15 +30,21 @@
  * longer reach the transfer, so the free itself needs no lock.
  */
 /* Slot of a transfer in devc->transfers[], or -1. For logging only. */
-static int transfer_idx(const struct dev_context *devc,
+static int transfer_idx(struct dev_context *devc,
 			const struct libusb_transfer *transfer)
 {
-	for (int i = 0; i < NUM_MAX_TRANSFERS; i++) {
-		if (devc->transfers[i] == transfer)
-			return i;
-	}
+	int idx = -1;
 
-	return -1;
+	g_mutex_lock(&devc->transfers_mutex);
+	for (int i = 0; i < NUM_MAX_TRANSFERS; i++) {
+		if (devc->transfers[i] == transfer) {
+			idx = i;
+			break;
+		}
+	}
+	g_mutex_unlock(&devc->transfers_mutex);
+
+	return idx;
 }
 
 static void release_transfer(struct dev_context *devc,
@@ -565,17 +571,25 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		/*
 		 * Publish the slot before submitting. The callback can run as
 		 * soon as libusb_submit_transfer() is called and has to find
-		 * the transfer here in order to retire it.
+		 * the transfer here in order to retire it. The lock matters
+		 * even though no transfer occupies this slot yet: the libusb
+		 * event thread scans the whole array in release_transfer(),
+		 * so an unlocked store here would race with that scan.
 		 */
+		g_mutex_lock(&devc->transfers_mutex);
 		devc->transfers[used] = transfer;
 		g_atomic_int_inc(&devc->num_transfers_used);
+		g_mutex_unlock(&devc->transfers_mutex);
 
 		ret = libusb_submit_transfer(transfer);
 		if (ret) {
 			sr_dbg("Failed to submit transfer[%d]: %s.", used,
 			       libusb_error_name(ret));
+			/* Never submitted, so no callback can be pending. */
+			g_mutex_lock(&devc->transfers_mutex);
 			devc->transfers[used] = NULL;
 			g_atomic_int_dec_and_test(&devc->num_transfers_used);
+			g_mutex_unlock(&devc->transfers_mutex);
 			libusb_free_transfer(transfer);
 			break;
 		}

@@ -643,7 +643,7 @@ static int config_channel_set(const struct sr_dev_inst *sdi,
 		if(!ch->enabled || ch->index < new_samplechannel){
 			continue;
 		}
-		for(unsigned int i = 0; i < devc->model->samplerate_table_size; i++){
+		for(unsigned int i = 0; i < devc->model->samplechannel_table_size; i++){
 			if(devc->model->samplechannel_table[i] > ch->index){
 				new_samplechannel = devc->model->samplechannel_table[i];
 				break;
@@ -780,16 +780,22 @@ static int slogic_usb_control_write(const struct sr_dev_inst *sdi,
 
 	ret = 0;
 	for (size_t i = 0; i < len; i += 4) {
-		ret += libusb_control_transfer(
+		/*
+		 * Test the chunk on its own. Accumulating first would let a
+		 * later error be cancelled out by the bytes already
+		 * transferred, e.g. 4 + LIBUSB_ERROR_NO_DEVICE == 0.
+		 */
+		int chunk = libusb_control_transfer(
 			usb->devhdl,
 			LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT,
 			request, value + i, index,
 			(unsigned char *)(data + i), 4, timeout);
-		if (ret < 0) {
+		if (chunk < 0) {
 			sr_err("%s: failed(libusb: %s)!", __func__,
-			       libusb_error_name(ret));
+			       libusb_error_name(chunk));
 			return SR_ERR_NA;
 		}
+		ret += chunk;
 	}
 
 	return ret;
@@ -820,16 +826,18 @@ static int slogic_usb_control_read(const struct sr_dev_inst *sdi,
 
 	ret = 0;
 	for (size_t i = 0; i < len; i += 4) {
-		ret += libusb_control_transfer(
+		/* Test the chunk on its own, see the write path above. */
+		int chunk = libusb_control_transfer(
 			usb->devhdl,
 			LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN,
 			request, value + i, index, (unsigned char *)data + i, 4,
 			timeout);
-		if (ret < 0) {
+		if (chunk < 0) {
 			sr_err("%s: failed(libusb: %s)!", __func__,
-			       libusb_error_name(ret));
+			       libusb_error_name(chunk));
 			return SR_ERR_NA;
 		}
+		ret += chunk;
 	}
 
 	return ret;
@@ -986,10 +994,32 @@ static inline void clear_ep(const struct sr_dev_inst *sdi)
 	size_t tmp_size = 4 * 1024 * 1024;
 	uint8_t *tmp = malloc(tmp_size);
 	int actual_length = 0;
+	int64_t deadline;
+
+	if (!tmp) {
+		sr_err("Failed to allocate %zu bytes to drain EP 0x%02x.",
+		       tmp_size, ep);
+		return;
+	}
+
+	/*
+	 * Bound the drain. This runs on the session thread during teardown,
+	 * before SR_DF_END is sent, and the Combo 8 stop path never tells
+	 * the device to stop streaming, so an unbounded loop can hang the
+	 * session outright.
+	 */
+	deadline = g_get_monotonic_time() + G_TIME_SPAN_SECOND;
 	do {
-		libusb_bulk_transfer(usb->devhdl, ep, tmp, tmp_size,
-				     &actual_length, 100);
+		if (libusb_bulk_transfer(usb->devhdl, ep, tmp, tmp_size,
+					 &actual_length, 100) < 0)
+			break;
+		if (g_get_monotonic_time() > deadline) {
+			sr_warn("Gave up draining EP 0x%02x, still streaming.",
+				ep);
+			break;
+		}
 	} while (actual_length);
+
 	free(tmp);
 	sr_dbg("Cleared EP: 0x%02x", ep);
 }
@@ -1005,6 +1035,13 @@ struct cmd_start_acquisition {
 		uint16_t sample_rate;
 	};
 	uint8_t sample_channel;
+	/*
+	 * slogic_usb_control_write() rounds the transfer length up to a
+	 * multiple of four. Without this byte the command is three bytes
+	 * long and the fourth one handed to the device is read from past
+	 * the end of the object. Pad explicitly so it is defined.
+	 */
+	uint8_t reserved;
 };
 #pragma pack(pop)
 
@@ -1042,52 +1079,90 @@ static int slogic_combo8_remote_stop(const struct sr_dev_inst *sdi)
 #define SLOGIC16U3_R32_FLAG 0x0008
 #define SLOGIC16U3_R32_AUX 0x000c
 
+/*
+ * Aux command buffer. The device's registers are addressed as halfwords
+ * and words, but the control helpers take a byte pointer. Casting a
+ * uint8_t array to uint16_t/uint32_t is undefined behaviour whatever the
+ * target's alignment rules, so give those accesses a real type: a union
+ * makes the punning well defined in C and carries the alignment the
+ * wider members need.
+ */
+union aux_buf {
+	uint8_t u8[64];
+	uint16_t u16[32];
+	uint32_t u32[16];
+};
+
+/*
+ * Length of the aux payload, as reported by the device in the top seven
+ * bits of the first halfword. The payload is read into u8 + 4, so only
+ * sizeof(u8) - 4 bytes are available, while the field can hold up to
+ * 127. Clamp it: an unclamped length lets the device overflow the
+ * caller's stack buffer. The limit is kept a multiple of four because
+ * both control helpers round the transfer length up to that.
+ */
+static size_t aux_payload_len(const union aux_buf *aux)
+{
+	size_t len, max;
+
+	len = aux->u16[0] >> 9;
+	max = (sizeof(aux->u8) - 4) & ~(size_t)3;
+
+	if (len > max) {
+		sr_warn("Device reported aux length %zu, clamping to %zu.",
+			len, max);
+		len = max;
+	}
+
+	return len;
+}
+
 static int slogic16U3_remote_test_mode(const struct sr_dev_inst *sdi, uint32_t mode) {
-	uint8_t cmd_aux[64] = { 0 }; // configure aux
+	union aux_buf aux = { 0 }; // configure aux
 
 	{
 		size_t retry = 0;
-		memset(cmd_aux, 0, sizeof(cmd_aux));
-		*(uint32_t *)(cmd_aux) = 0x00000005;
+		memset(&aux, 0, sizeof(aux));
+		aux.u32[0] = 0x00000005;
 		slogic_usb_control_write(sdi,
 					 SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
-					 SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4,
+					 SLOGIC16U3_R32_AUX, 0x0000, aux.u8, 4,
 					 500);
 		do {
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
-				SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4, 500);
+				SLOGIC16U3_R32_AUX, 0x0000, aux.u8, 4, 500);
 			sr_dbg("[%zu]read aux testmode: %08x.", retry,
-			       ((uint32_t *)cmd_aux)[0]);
+			       aux.u32[0]);
 			retry += 1;
 			if (retry > 5)
 				return SR_ERR_TIMEOUT;
-		} while (!(cmd_aux[2] & 0x01));
+		} while (!(aux.u8[2] & 0x01));
 
-		sr_dbg("test_mode length: %u.", (*(uint16_t *)cmd_aux) >> 9);
+		sr_dbg("test_mode length: %zu.", aux_payload_len(&aux));
 		slogic_usb_control_read(sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 					SLOGIC16U3_R32_AUX + 4, 0x0000,
-					cmd_aux + 4,
-					(*(uint16_t *)cmd_aux) >> 9, 500);
+					aux.u8 + 4,
+					aux_payload_len(&aux), 500);
 
-		sr_dbg("aux rd: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+		sr_dbg("aux rd: %08x %08x.", aux.u32[0], aux.u32[1]);
 
-		((uint32_t *)(cmd_aux + 4))[0] = mode;
+		aux.u32[1] = mode;
 
-		sr_dbg("aux wr: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+		sr_dbg("aux wr: %08x %08x.", aux.u32[0], aux.u32[1]);
 		slogic_usb_control_write(sdi,
 					 SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
 					 SLOGIC16U3_R32_AUX + 4, 0x0000,
-					 cmd_aux + 4,
-					 (*(uint16_t *)cmd_aux) >> 9, 500);
+					 aux.u8 + 4,
+					 aux_payload_len(&aux), 500);
 
 		slogic_usb_control_read(sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 					SLOGIC16U3_R32_AUX + 4, 0x0000,
-					cmd_aux + 4,
-					(*(uint16_t *)cmd_aux) >> 9, 500);
-		sr_dbg("aux rd: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+					aux.u8 + 4,
+					aux_payload_len(&aux), 500);
+		sr_dbg("aux rd: %08x %08x.", aux.u32[0], aux.u32[1]);
 
-		if (mode != *(uint32_t *)(cmd_aux + 4)) {
+		if (mode != aux.u32[1]) {
 			sr_dbg("Failed to configure test_mode.");
 		} else {
 			sr_dbg("Succeed to configure test_mode.");
@@ -1114,51 +1189,51 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 	const uint8_t cmd_run[] = { 0x01, 0x00, 0x00, 0x00 };
-	uint8_t cmd_aux[64] = { 0 }; // configure aux
+	union aux_buf aux = { 0 }; // configure aux
 
 	{
 		size_t retry = 0;
-		memset(cmd_aux, 0, sizeof(cmd_aux));
-		*(uint32_t *)(cmd_aux) = 0x00000001;
+		memset(&aux, 0, sizeof(aux));
+		aux.u32[0] = 0x00000001;
 		slogic_usb_control_write(sdi,
 					 SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
-					 SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4,
+					 SLOGIC16U3_R32_AUX, 0x0000, aux.u8, 4,
 					 500);
 		do {
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
-				SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4, 500);
+				SLOGIC16U3_R32_AUX, 0x0000, aux.u8, 4, 500);
 			sr_dbg("[%zu]read aux channel: %08x.", retry,
-			       ((uint32_t *)cmd_aux)[0]);
+			       aux.u32[0]);
 			retry += 1;
 			if (retry > 5)
 				return SR_ERR_TIMEOUT;
-		} while (!(cmd_aux[2] & 0x01));
-		sr_dbg("channel length: %u.", (*(uint16_t *)cmd_aux) >> 9);
+		} while (!(aux.u8[2] & 0x01));
+		sr_dbg("channel length: %zu.", aux_payload_len(&aux));
 		slogic_usb_control_read(sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 					SLOGIC16U3_R32_AUX + 4, 0x0000,
-					cmd_aux + 4,
-					(*(uint16_t *)cmd_aux) >> 9, 500);
+					aux.u8 + 4,
+					aux_payload_len(&aux), 500);
 
-		sr_dbg("aux rd: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+		sr_dbg("aux rd: %08x %08x.", aux.u32[0], aux.u32[1]);
 
-		*(uint32_t *)(cmd_aux + 4) = (1ull << devc->cur_samplechannel) - 1;
+		aux.u32[1] = (1ull << devc->cur_samplechannel) - 1;
 
-		sr_dbg("aux wr: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+		sr_dbg("aux wr: %08x %08x.", aux.u32[0], aux.u32[1]);
 		slogic_usb_control_write(sdi,
 					 SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
 					 SLOGIC16U3_R32_AUX + 4, 0x0000,
-					 cmd_aux + 4,
-					 (*(uint16_t *)cmd_aux) >> 9, 500);
+					 aux.u8 + 4,
+					 aux_payload_len(&aux), 500);
 
 		slogic_usb_control_read(sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 					SLOGIC16U3_R32_AUX + 4, 0x0000,
-					cmd_aux + 4,
-					(*(uint16_t *)cmd_aux) >> 9, 500);
-		sr_dbg("aux rd: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+					aux.u8 + 4,
+					aux_payload_len(&aux), 500);
+		sr_dbg("aux rd: %08x %08x.", aux.u32[0], aux.u32[1]);
 
 		if ((1ull << devc->cur_samplechannel) - 1 !=
-		    *(uint32_t *)(cmd_aux + 4)) {
+		    aux.u32[1]) {
 			sr_dbg("Failed to configure sample channel.");
 		} else {
 			sr_dbg("Succeed to configure sample channel.");
@@ -1167,72 +1242,90 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 
 	{
 		size_t retry = 0;
-		memset(cmd_aux, 0, sizeof(cmd_aux));
-		*(uint32_t *)(cmd_aux) = 0x00000002;
+		memset(&aux, 0, sizeof(aux));
+		aux.u32[0] = 0x00000002;
 		slogic_usb_control_write(sdi,
 					 SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
-					 SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4,
+					 SLOGIC16U3_R32_AUX, 0x0000, aux.u8, 4,
 					 500);
 		do {
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
-				SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4, 500);
+				SLOGIC16U3_R32_AUX, 0x0000, aux.u8, 4, 500);
 			sr_dbg("[%zu]read aux samplerate: %08x.", retry,
-			       ((uint32_t *)cmd_aux)[0]);
+			       aux.u32[0]);
 			retry += 1;
 			if (retry > 5)
 				return SR_ERR_TIMEOUT;
-		} while (!(cmd_aux[2] & 0x01));
-		sr_dbg("samplerate length: %u.", (*(uint16_t *)cmd_aux) >> 9);
+		} while (!(aux.u8[2] & 0x01));
+		sr_dbg("samplerate length: %zu.", aux_payload_len(&aux));
 
-		while (((uint16_t *)(cmd_aux + 4))[0] <= 1) {
-			slogic_usb_control_read(
-				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
-				SLOGIC16U3_R32_AUX + 4, 0x0000, cmd_aux + 4,
-				(*(uint16_t *)cmd_aux) >> 9, 500);
+		/*
+		 * The loop variable is re-read from the device on every pass,
+		 * so the increment below only sticks if the device agrees.
+		 * Cap the iterations: without one, firmware that keeps
+		 * reporting the same base index spins here forever, on the
+		 * session thread, in the middle of starting an acquisition.
+		 */
+		size_t base_retry = 0;
+		while (aux.u16[2] <= 1) {
+			if (base_retry++ > 5) {
+				sr_err("Giving up configuring samplerate: "
+				       "device keeps reporting base index %u.",
+				       aux.u16[2]);
+				return SR_ERR_TIMEOUT;
+			}
+			if (slogic_usb_control_read(
+				    sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
+				    SLOGIC16U3_R32_AUX + 4, 0x0000, aux.u8 + 4,
+				    aux_payload_len(&aux),
+				    500) < 0) {
+				sr_err("Failed to read samplerate base.");
+				return SR_ERR_IO;
+			}
 
-			sr_dbg("aux rd: %08x %x %u %u.", ((uint32_t *)cmd_aux)[0],
-			       ((uint16_t *)(cmd_aux + 4))[0],
-			       ((uint16_t *)(cmd_aux + 4))[1],
-			       ((uint32_t *)(cmd_aux + 4))[1]);
+			sr_dbg("aux rd: %08x %x %u %u.", aux.u32[0],
+			       aux.u16[2],
+			       aux.u16[3],
+			       aux.u32[2]);
 
 			uint64_t base =
-				SR_MHZ(1) * ((uint16_t *)(cmd_aux + 4))[1];
+				SR_MHZ(1) * aux.u16[3];
 			if (base % devc->cur_samplerate) {
 				sr_dbg("Failed to configure samplerate from base[%u] %" PRIu64 ".",
-				       ((uint16_t *)(cmd_aux + 4))[0], base);
-				((uint16_t *)(cmd_aux + 4))[0] += 1;
+				       aux.u16[2], base);
+				aux.u16[2] += 1;
 				slogic_usb_control_write(
 					sdi,
 					SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
 					SLOGIC16U3_R32_AUX + 4, 0x0000,
-					cmd_aux + 4, 4, 500);
+					aux.u8 + 4, 4, 500);
 				continue;
 			}
 			uint32_t div = base / devc->cur_samplerate;
-			((uint32_t *)(cmd_aux + 4))[1] = div-1;
+			aux.u32[2] = div-1;
 
-			sr_dbg("aux wr: %08x %x %u %u.", ((uint32_t *)cmd_aux)[0],
-			       ((uint16_t *)(cmd_aux + 4))[0],
-			       ((uint16_t *)(cmd_aux + 4))[1],
-			       ((uint32_t *)(cmd_aux + 4))[1]);
+			sr_dbg("aux wr: %08x %x %u %u.", aux.u32[0],
+			       aux.u16[2],
+			       aux.u16[3],
+			       aux.u32[2]);
 			slogic_usb_control_write(
 				sdi, SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
-				SLOGIC16U3_R32_AUX + 4, 0x0000, cmd_aux + 4,
-				(*(uint16_t *)cmd_aux) >> 9, 500);
+				SLOGIC16U3_R32_AUX + 4, 0x0000, aux.u8 + 4,
+				aux_payload_len(&aux), 500);
 
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
-				SLOGIC16U3_R32_AUX + 4, 0x0000, cmd_aux + 4,
-				(*(uint16_t *)cmd_aux) >> 9, 500);
-			sr_dbg("aux rd: %08x %x %u %u.", ((uint32_t *)cmd_aux)[0],
-			       ((uint16_t *)(cmd_aux + 4))[0],
-			       ((uint16_t *)(cmd_aux + 4))[1],
-			       ((uint32_t *)(cmd_aux + 4))[1]);
+				SLOGIC16U3_R32_AUX + 4, 0x0000, aux.u8 + 4,
+				aux_payload_len(&aux), 500);
+			sr_dbg("aux rd: %08x %x %u %u.", aux.u32[0],
+			       aux.u16[2],
+			       aux.u16[3],
+			       aux.u32[2]);
 			break;
 		}
 
-		if (((uint16_t *)(cmd_aux + 4))[0] <= 1) {
+		if (aux.u16[2] <= 1) {
 			sr_dbg("Succeed to configure samplerate.");
 		} else {
 			sr_dbg("Failed to configure samplerate.");
@@ -1241,50 +1334,50 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 
 	{
 		size_t retry = 0;
-		memset(cmd_aux, 0, sizeof(cmd_aux));
-		*(uint32_t *)(cmd_aux) = 0x00000003;
+		memset(&aux, 0, sizeof(aux));
+		aux.u32[0] = 0x00000003;
 		slogic_usb_control_write(sdi,
 					 SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
-					 SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4,
+					 SLOGIC16U3_R32_AUX, 0x0000, aux.u8, 4,
 					 500);
 		do {
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
-				SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4, 500);
+				SLOGIC16U3_R32_AUX, 0x0000, aux.u8, 4, 500);
 			sr_dbg("[%zu]read vref(/1024x1v6): %08x.", retry,
-			       ((uint32_t *)cmd_aux)[0]);
+			       aux.u32[0]);
 			retry += 1;
 			if (retry > 5)
 				return SR_ERR_TIMEOUT;
-		} while (!(cmd_aux[2] & 0x01));
-		// *(uint16_t*)cmd_aux &= ~0xfe00;
-		// *(uint16_t*)cmd_aux |= 0x800;
-		sr_dbg("vref length: %u.", (*(uint16_t *)cmd_aux) >> 9);
+		} while (!(aux.u8[2] & 0x01));
+		// *(uint16_t*)aux.u8 &= ~0xfe00;
+		// *(uint16_t*)aux.u8 |= 0x800;
+		sr_dbg("vref length: %zu.", aux_payload_len(&aux));
 		slogic_usb_control_read(sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 					SLOGIC16U3_R32_AUX + 4, 0x0000,
-					cmd_aux + 4,
-					(*(uint16_t *)cmd_aux) >> 9, 500);
+					aux.u8 + 4,
+					aux_payload_len(&aux), 500);
 
-		sr_dbg("aux rd: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+		sr_dbg("aux rd: %08x %08x.", aux.u32[0], aux.u32[1]);
 
 		uint32_t vref_code =
 			(uint32_t)((devc->voltage_threshold[0] +
 				    devc->voltage_threshold[1]) /
 				   2 / 3.33 / 2 * 1024);
-		((uint32_t *)(cmd_aux + 4))[0] = vref_code;
+		aux.u32[1] = vref_code;
 
-		sr_dbg("aux wr: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+		sr_dbg("aux wr: %08x %08x.", aux.u32[0], aux.u32[1]);
 		slogic_usb_control_write(sdi,
 					 SLOGIC16U3_CONTROL_OUT_REQ_REG_WRITE,
 					 SLOGIC16U3_R32_AUX + 4, 0x0000,
-					 cmd_aux + 4,
-					 (*(uint16_t *)cmd_aux) >> 9, 500);
+					 aux.u8 + 4,
+					 aux_payload_len(&aux), 500);
 
 		slogic_usb_control_read(sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 					SLOGIC16U3_R32_AUX + 4, 0x0000,
-					cmd_aux + 4,
-					(*(uint16_t *)cmd_aux) >> 9, 500);
-		sr_dbg("aux rd: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
+					aux.u8 + 4,
+					aux_payload_len(&aux), 500);
+		sr_dbg("aux rd: %08x %08x.", aux.u32[0], aux.u32[1]);
 
 		/*
 		 * Compare against what was written, not against a fixed 1024.
@@ -1292,9 +1385,9 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 		 * is outside the advertised 0-6V range, so the fixed
 		 * comparison reported failure for every valid setting.
 		 */
-		if (vref_code != *(uint32_t *)(cmd_aux + 4)) {
+		if (vref_code != aux.u32[1]) {
 			sr_dbg("Failed to configure vref: wrote %u, read back %u.",
-			       vref_code, *(uint32_t *)(cmd_aux + 4));
+			       vref_code, aux.u32[1]);
 		} else {
 			sr_dbg("Succeed to configure vref.");
 		}
