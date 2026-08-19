@@ -81,45 +81,74 @@ struct dev_context {
 		uint32_t expected_rate_MBps;
 	}; // configuration
 
+	/*
+	 * Acquisition runs across two threads: receive_transfer() is called
+	 * on the libusb event thread, handle_events() and the soft trigger
+	 * helper it calls run on the session thread. Fields below are marked
+	 * with the thread that owns them. Only acq_aborted, trigger_fired and
+	 * num_transfers_used are shared, and those are accessed through
+	 * g_atomic_int_*(). Everything else must stay single-owner.
+	 */
 	struct {
 		GThread *libusb_event_thread;
-		int libusb_event_thread_run;
+		gint libusb_event_thread_run; /* Shared, atomic. */
 
 		enum libusb_speed speed;
 
+		/* Set up before the threads start, read-only afterwards. */
 		uint64_t samples_need_nbytes;
-		uint64_t samples_got_nbytes;
+		uint64_t per_transfer_duration; /* unit: ms */
+		uint64_t per_transfer_nbytes;
+		size_t timeout_count_limit;
+
 		/*
-		 * Bytes actually passed on to the session. Only ever touched
-		 * from the session thread (handle_events() and the soft
-		 * trigger helper it calls), unlike samples_got_nbytes which
-		 * doubles as transfer flow control and is updated from the
-		 * libusb event thread.
+		 * Bytes accepted off the wire. Drives transfer flow control
+		 * only. Owned by the libusb event thread.
+		 */
+		uint64_t samples_got_nbytes;
+
+		/*
+		 * Bytes actually passed on to the session, which is what the
+		 * sample limit is enforced against. Owned by the session
+		 * thread.
 		 */
 		uint64_t samples_sent_nbytes;
 
-		uint64_t per_transfer_duration; /* unit: ms */
-		uint64_t per_transfer_nbytes;
-
+		/* libusb event thread. */
 		size_t num_transfers_completed;
-		size_t num_transfers_used;
-		size_t timeout_count_limit;
-		struct libusb_transfer *transfers[NUM_MAX_TRANSFERS];
-
 		uint64_t transfers_reached_nbytes; /* real received bytes in all */
 		uint64_t transfers_reached_nbytes_latest; /* real received bytes this transfer */
 		int64_t transfers_reached_time_start;
 		int64_t transfers_reached_time_latest;
-
-		GAsyncQueue *raw_data_queue;
 		uint64_t timeout_count;
+		/* Whether the hardware's 4 junk head bytes were dropped. */
+		gboolean head_dropped;
+
+		/* Shared, atomic. */
+		gint num_transfers_used;
+
+		/*
+		 * A transfer is freed by its own callback, on the libusb
+		 * event thread, while handle_events() cancels transfers from
+		 * the session thread. Both reach them through this array, so
+		 * it needs a lock: without one the session thread can cancel
+		 * a transfer that was just freed.
+		 */
+		GMutex transfers_mutex;
+		struct libusb_transfer *transfers[NUM_MAX_TRANSFERS];
+
+		GAsyncQueue *raw_data_queue; /* Thread safe by itself. */
 	}; // usb
 
-	int acq_aborted;
+	/* Session thread. */
+	gboolean remote_stopped;
 
-	/* Triggers */
+	/* Shared, atomic. */
+	gint acq_aborted;
+	gint trigger_fired;
+
+	/* Triggers. Session thread. */
 	uint64_t capture_ratio;
-	gboolean trigger_fired;
 	struct soft_trigger_logic *stl;
 
 	double voltage_threshold[2];

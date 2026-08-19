@@ -22,6 +22,41 @@
 
 #include "protocol.h"
 
+/*
+ * Retire a transfer that will not be resubmitted. Called only from the
+ * transfer's own callback, which libusb explicitly permits: it snapshots
+ * transfer->flags before invoking the callback for exactly this reason.
+ * Clearing the slot under the lock first means handle_events() can no
+ * longer reach the transfer, so the free itself needs no lock.
+ */
+/* Slot of a transfer in devc->transfers[], or -1. For logging only. */
+static int transfer_idx(const struct dev_context *devc,
+			const struct libusb_transfer *transfer)
+{
+	for (int i = 0; i < NUM_MAX_TRANSFERS; i++) {
+		if (devc->transfers[i] == transfer)
+			return i;
+	}
+
+	return -1;
+}
+
+static void release_transfer(struct dev_context *devc,
+			     struct libusb_transfer *transfer)
+{
+	g_mutex_lock(&devc->transfers_mutex);
+	for (size_t i = 0; i < NUM_MAX_TRANSFERS; i++) {
+		if (devc->transfers[i] == transfer) {
+			devc->transfers[i] = NULL;
+			break;
+		}
+	}
+	g_atomic_int_dec_and_test(&devc->num_transfers_used);
+	g_mutex_unlock(&devc->transfers_mutex);
+
+	libusb_free_transfer(transfer);
+}
+
 static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 {
 	int ret;
@@ -44,18 +79,27 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	double expected_transfer_duration =
 		(double)devc->per_transfer_nbytes / expected_rate;
 
-	devc->num_transfers_used -= 1;
+	/*
+	 * Snapshot the trigger state once so every decision below in this
+	 * callback is made against the same value, even if the session
+	 * thread flips it midway.
+	 */
+	gboolean trigger_fired = g_atomic_int_get(&devc->trigger_fired);
+
+	/*
+	 * The transfer stays counted until it is actually freed below, so
+	 * the count can never read zero while a transfer is still in use.
+	 */
+	gboolean resubmitted = FALSE;
+
 	devc->num_transfers_completed += 1;
 	sr_spew("[%zu] Transfer #%d status: %d(%s).",
-		devc->num_transfers_completed,
-		std_u64_idx(g_variant_new_uint64((uint64_t)transfer),
-			    (uint64_t *)devc->transfers, NUM_MAX_TRANSFERS),
+		devc->num_transfers_completed, transfer_idx(devc, transfer),
 		transfer->status, libusb_error_name(transfer->status));
 	switch (transfer->status) {
 	case LIBUSB_TRANSFER_COMPLETED: /* normal case */
 	case LIBUSB_TRANSFER_TIMED_OUT: /* may have received some data */
 	{
-		int first_here = devc->transfers_reached_time_latest == devc->transfers_reached_time_start;
 		devc->transfers_reached_time_latest =
 			transfers_reached_time_now;
 
@@ -64,18 +108,22 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			devc->transfers_reached_nbytes_latest;
 
 		// remove 32bit for hardware bug workaround
-		if (first_here) {
+		if (!devc->head_dropped) {
 			const int drop_bytes = 4;
 			if (transfer->actual_length >= drop_bytes) {
 				transfer->actual_length -= drop_bytes;
 				memmove(transfer->buffer, transfer->buffer + drop_bytes,
 					transfer->actual_length);
-			} else {
-				devc->transfers_reached_time_latest = devc->transfers_reached_time_start;
+				devc->head_dropped = TRUE;
 			}
+			/* Too short: retry on the next transfer. */
 		}
 
-		if (devc->trigger_fired) {
+		/*
+		 * samples_need_nbytes is 0 when running continuously. There
+		 * is no limit to clamp against then, and every byte is kept.
+		 */
+		if (trigger_fired && devc->samples_need_nbytes) {
 			uint64_t remaining =
 				devc->samples_need_nbytes >
 						devc->samples_got_nbytes ?
@@ -87,13 +135,17 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 		}
 		devc->samples_got_nbytes += transfer->actual_length;
 
+		/* No meaningful percentage without a limit to divide by. */
+		double progress_pct = devc->samples_need_nbytes ?
+					      100. * devc->samples_got_nbytes /
+						      devc->samples_need_nbytes :
+					      0.;
+
 		sr_dbg("[%zu] Got %" PRIu64 "/%" PRIu64
 		       "(%.2f%%) => speed: %.2fMBps, %.2fMBps(avg), %.0fMBps(exp) => "
 		       "+%.3f=%.3fms.",
 		       devc->num_transfers_completed, devc->samples_got_nbytes,
-		       devc->samples_need_nbytes,
-		       100.f * devc->samples_got_nbytes /
-			       devc->samples_need_nbytes,
+		       devc->samples_need_nbytes, progress_pct,
 		       (double)devc->transfers_reached_nbytes_latest /
 			       transfers_reached_duration,
 		       (double)devc->transfers_reached_nbytes /
@@ -116,7 +168,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 				sr_err("Failed to allocate memory: %" PRIu64
 				       " bytes!",
 				       devc->per_transfer_nbytes);
-				devc->acq_aborted = 1;
+				g_atomic_int_set(&devc->acq_aborted, 1);
 				break;
 			}
 			transfer->buffer = ptr;
@@ -124,24 +176,34 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			g_async_queue_push(devc->raw_data_queue, array);
 		}
 
-		if (!devc->trigger_fired)
+		/*
+		 * Until the trigger fires nothing counts towards the limit,
+		 * so keep the budget full and the transfers flowing.
+		 */
+		if (!trigger_fired)
 			devc->samples_got_nbytes = 0;
 
-		if (devc->samples_got_nbytes +
-			    devc->num_transfers_used *
-				    devc->per_transfer_nbytes <
-		    devc->samples_need_nbytes) {
+		uint64_t others_pending =
+			(uint64_t)g_atomic_int_get(&devc->num_transfers_used) - 1;
+		/*
+		 * Continuous mode has no budget to run down, so the transfer
+		 * is always put back in flight.
+		 */
+		if (!devc->samples_need_nbytes ||
+		    devc->samples_got_nbytes +
+				    others_pending * devc->per_transfer_nbytes <
+			    devc->samples_need_nbytes) {
 			transfer->actual_length = 0;
 			transfer->timeout = (TRANSFERS_DURATION_TOLERANCE + 1) *
 					    devc->per_transfer_duration *
-					    (devc->num_transfers_used + 2);
+					    (others_pending + 3);
 			ret = libusb_submit_transfer(transfer);
 			if (ret) {
 				sr_dbg("Failed to submit transfer: %s",
 				       libusb_error_name(ret));
 			} else {
 				sr_spew("Resubmit transfer: %p", transfer);
-				devc->num_transfers_used += 1;
+				resubmitted = TRUE;
 			}
 		}
 	} break;
@@ -150,7 +212,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 	case LIBUSB_TRANSFER_STALL:
 	case LIBUSB_TRANSFER_NO_DEVICE:
 	default:
-		devc->acq_aborted = 1;
+		g_atomic_int_set(&devc->acq_aborted, 1);
 		break;
 	}
 
@@ -180,12 +242,15 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 				expected_rate * (1.0 - TRANSFERS_DURATION_TOLERANCE),
 				average_rate, expected_rate * 0.95,
 				devc->timeout_count);
-		devc->acq_aborted = 1;
+		g_atomic_int_set(&devc->acq_aborted, 1);
 	}
 
-	if (devc->num_transfers_used == 0) {
-		devc->acq_aborted = 1;
-	}
+	/* Last use of transfer: it is dangling past this point. */
+	if (!resubmitted)
+		release_transfer(devc, transfer);
+
+	if (g_atomic_int_get(&devc->num_transfers_used) == 0)
+		g_atomic_int_set(&devc->acq_aborted, 1);
 };
 
 static int handle_events(int fd, int revents, void *cb_data)
@@ -205,8 +270,14 @@ static int handle_events(int fd, int revents, void *cb_data)
 
 	// sr_spew("handle_events enter");
 
-	if (devc->acq_aborted) {
-		if (devc->num_transfers_used) {
+	if (g_atomic_int_get(&devc->acq_aborted)) {
+		if (g_atomic_int_get(&devc->num_transfers_used)) {
+			/*
+			 * Only cancel here. Each transfer is freed by its own
+			 * callback once it completes, so the pointers stay
+			 * valid for as long as the lock is held.
+			 */
+			g_mutex_lock(&devc->transfers_mutex);
 			for (size_t i = 0; i < NUM_MAX_TRANSFERS; ++i) {
 				struct libusb_transfer *transfer =
 					devc->transfers[i];
@@ -214,23 +285,16 @@ static int handle_events(int fd, int revents, void *cb_data)
 					libusb_cancel_transfer(transfer);
 				}
 			}
+			g_mutex_unlock(&devc->transfers_mutex);
 		} else {
-			int freed = 0;
-			for (size_t i = 0; i < NUM_MAX_TRANSFERS; ++i) {
-				struct libusb_transfer *transfer =
-					devc->transfers[i];
-				if (transfer) {
-					freed += 1;
-					libusb_free_transfer(transfer);
-					devc->transfers[i] = NULL;
-				}
-			}
-			if (freed) {
-				sr_dbg("Freed %d transfers.", freed);
-			} else {
+			/* Every transfer has been freed by its callback. */
+			if (!devc->remote_stopped) {
 				if ((devc->model->operation.remote_stop(sdi)) < 0) {
 					sr_err("Unhandled `CMD_STOP`");
 				}
+				devc->remote_stopped = TRUE;
+			}
+			{
 				if (!g_async_queue_length(
 					   devc->raw_data_queue)) {
 					sr_dbg("Freed all transfers.");
@@ -240,7 +304,8 @@ static int handle_events(int fd, int revents, void *cb_data)
 					if (devc->stl) {
 						soft_trigger_logic_free(devc->stl);
 						devc->stl = NULL;
-						devc->trigger_fired = FALSE;
+						g_atomic_int_set(&devc->trigger_fired,
+								 FALSE);
 					}
 				}
 			}
@@ -258,7 +323,7 @@ static int handle_events(int fd, int revents, void *cb_data)
 	} else if (g_async_queue_length(devc->raw_data_queue)) {
 		GByteArray *array = g_async_queue_try_pop(devc->raw_data_queue);
 		if (array != NULL) {
-			if (devc->trigger_fired) {
+			if (g_atomic_int_get(&devc->trigger_fired)) {
 				size_t len = array->len;
 
 				/*
@@ -292,14 +357,15 @@ static int handle_events(int fd, int revents, void *cb_data)
 				if (slogic_soft_trigger_raw_data(array->data,
 								 array->len,
 								 sdi) >= 0)
-					devc->trigger_fired = TRUE;
+					g_atomic_int_set(&devc->trigger_fired,
+							 TRUE);
 			}
 			g_byte_array_unref(array);
 
 			if (devc->samples_need_nbytes &&
 			    devc->samples_sent_nbytes >=
 				    devc->samples_need_nbytes)
-				devc->acq_aborted = 1;
+				g_atomic_int_set(&devc->acq_aborted, 1);
 		}
 	}
 
@@ -422,12 +488,29 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		return ret;
 	}
 
-	devc->acq_aborted = 0;
-	devc->num_transfers_used = 0;
+	/*
+	 * Resetting the state below is only safe because no callback from a
+	 * previous acquisition can still be in flight: handle_events() sends
+	 * SR_DF_END and removes the session source only once
+	 * num_transfers_used has reached 0, i.e. after every transfer has
+	 * been freed by its own callback. The session will not start another
+	 * acquisition before SR_DF_END.
+	 */
+	g_atomic_int_set(&devc->acq_aborted, 0);
+	g_atomic_int_set(&devc->num_transfers_used, 0);
 	devc->num_transfers_completed = 0;
 	memset(devc->transfers, 0, sizeof(devc->transfers));
 	devc->transfers_reached_nbytes = 0;
 	devc->timeout_count = 0;
+	devc->head_dropped = FALSE;
+	devc->remote_stopped = FALSE;
+	/*
+	 * Establish the baseline before anything is submitted. Setting it
+	 * after remote_run() left callbacks reading whatever the previous
+	 * acquisition happened to leave behind.
+	 */
+	devc->transfers_reached_time_start = g_get_monotonic_time();
+	devc->transfers_reached_time_latest = devc->transfers_reached_time_start;
 	devc->raw_data_queue = g_async_queue_new();
 
 	if (!devc->raw_data_queue) {
@@ -435,21 +518,36 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		return SR_ERR_MALLOC;
 	}
 
-	while (devc->num_transfers_used < NUM_MAX_TRANSFERS &&
-	       devc->samples_got_nbytes + devc->num_transfers_used *
-						  devc->per_transfer_nbytes <
-		       devc->samples_need_nbytes) {
+	/*
+	 * samples_need_nbytes is 0 in continuous mode. Queue the full set of
+	 * transfers then: without this the loop below submits nothing and the
+	 * acquisition fails with SR_ERR_IO before a single byte is read.
+	 */
+	while (TRUE) {
+		/*
+		 * Read the count once per iteration: a transfer that fails
+		 * early can retire itself from the libusb event thread while
+		 * this loop is still submitting the others.
+		 */
+		int used = g_atomic_int_get(&devc->num_transfers_used);
+
+		if (used >= NUM_MAX_TRANSFERS)
+			break;
+		if (devc->samples_need_nbytes &&
+		    devc->samples_got_nbytes +
+				    (uint64_t)used * devc->per_transfer_nbytes >=
+			    devc->samples_need_nbytes)
+			break;
+
 		uint8_t *dev_buf = malloc(devc->per_transfer_nbytes);
 		if (!dev_buf) {
-			sr_dbg("Failed to allocate memory[%zu]",
-			       devc->num_transfers_used);
+			sr_dbg("Failed to allocate memory[%d]", used);
 			break;
 		}
 
 		struct libusb_transfer *transfer = libusb_alloc_transfer(0);
 		if (!transfer) {
-			sr_dbg("Failed to allocate transfer[%zu]",
-			       devc->num_transfers_used);
+			sr_dbg("Failed to allocate transfer[%d]", used);
 			free(dev_buf);
 			break;
 		}
@@ -459,26 +557,35 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 			devc->per_transfer_nbytes, receive_transfer,
 			(void *)sdi,
 			(TRANSFERS_DURATION_TOLERANCE + 1) *
-				devc->per_transfer_duration *
-				(devc->num_transfers_used + 2));
+				devc->per_transfer_duration * (used + 2));
 		transfer->actual_length = 0;
 
 		transfer->flags |= LIBUSB_TRANSFER_FREE_BUFFER;
+
+		/*
+		 * Publish the slot before submitting. The callback can run as
+		 * soon as libusb_submit_transfer() is called and has to find
+		 * the transfer here in order to retire it.
+		 */
+		devc->transfers[used] = transfer;
+		g_atomic_int_inc(&devc->num_transfers_used);
+
 		ret = libusb_submit_transfer(transfer);
 		if (ret) {
-			sr_dbg("Failed to submit transfer[%zu]: %s.",
-			       devc->num_transfers_used,
+			sr_dbg("Failed to submit transfer[%d]: %s.", used,
 			       libusb_error_name(ret));
+			devc->transfers[used] = NULL;
+			g_atomic_int_dec_and_test(&devc->num_transfers_used);
 			libusb_free_transfer(transfer);
 			break;
 		}
-		devc->transfers[devc->num_transfers_used] = transfer;
-		devc->num_transfers_used += 1;
 	}
-	devc->timeout_count_limit = devc->num_transfers_used;
-	sr_dbg("Submited %zu transfers", devc->num_transfers_used);
 
-	if (!devc->num_transfers_used) {
+	int num_submitted = g_atomic_int_get(&devc->num_transfers_used);
+	devc->timeout_count_limit = num_submitted;
+	sr_dbg("Submited %d transfers", num_submitted);
+
+	if (!num_submitted) {
 		return SR_ERR_IO;
 	}
 
@@ -490,7 +597,7 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 			      (devc->per_transfer_duration / 2) ?: 1,
 			      handle_events, (void *)sdi);
 
-	devc->trigger_fired = TRUE;
+	g_atomic_int_set(&devc->trigger_fired, TRUE);
 
 	struct sr_trigger *trigger = NULL;
 	/* Setup triggers */
@@ -501,7 +608,7 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->stl = soft_trigger_logic_new(sdi, trigger, pre_trigger_samples);
 		if (!devc->stl)
 			return SR_ERR_MALLOC;
-		devc->trigger_fired = FALSE;
+		g_atomic_int_set(&devc->trigger_fired, FALSE);
 	}
 
 	if ((ret = devc->model->operation.remote_run(sdi)) < 0) {
@@ -510,10 +617,6 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		sipeed_slogic_acquisition_stop((struct sr_dev_inst *)sdi);
 		return ret;
 	}
-
-	devc->transfers_reached_time_start = g_get_monotonic_time();
-	devc->transfers_reached_time_latest =
-		devc->transfers_reached_time_start;
 
 	return SR_OK;
 }
@@ -524,7 +627,7 @@ SR_PRIV int sipeed_slogic_acquisition_stop(struct sr_dev_inst *sdi)
 
 	devc = sdi->priv;
 
-	devc->acq_aborted = 1;
+	g_atomic_int_set(&devc->acq_aborted, 1);
 
 	return SR_OK;
 }

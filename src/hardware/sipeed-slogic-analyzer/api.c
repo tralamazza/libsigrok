@@ -183,7 +183,7 @@ static gpointer libusb_event_thread_func(gpointer user_data)
 	di = sdi->driver;
 	drvc = di->context;
 
-	while (devc->libusb_event_thread_run) {
+	while (g_atomic_int_get(&devc->libusb_event_thread_run)) {
 		libusb_handle_events_timeout_completed(
 			drvc->sr_ctx->libusb_ctx, &(struct timeval){ 1, 0 },
 			NULL);
@@ -276,6 +276,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 			sdi->inst_type = SR_INST_USB;
 
 			devc = g_malloc0(sizeof(struct dev_context));
+			g_mutex_init(&devc->transfers_mutex);
 			sdi->priv = devc;
 
 			{
@@ -361,11 +362,11 @@ static int dev_open(struct sr_dev_inst *sdi)
 		return SR_ERR;
 	}
 
-	devc->libusb_event_thread_run = 1;
+	g_atomic_int_set(&devc->libusb_event_thread_run, 1);
 	devc->libusb_event_thread = g_thread_new("libusb_event_thread",
 						 libusb_event_thread_func, sdi);
 	if (!devc->libusb_event_thread) {
-		devc->libusb_event_thread_run = 0;
+		g_atomic_int_set(&devc->libusb_event_thread_run, 0);
 		sr_err("Unable to new libusb_event_thread!");
 		return SR_ERR_MALLOC;
 	}
@@ -408,7 +409,7 @@ static int dev_close(struct sr_dev_inst *sdi)
 		}
 	}
 
-	devc->libusb_event_thread_run = 0;
+	g_atomic_int_set(&devc->libusb_event_thread_run, 0);
 	sr_usb_close(usb);
 	if (devc->libusb_event_thread) {
 		g_thread_join(devc->libusb_event_thread);
@@ -659,6 +660,17 @@ static int config_list(uint32_t key, GVariant **data,
 	return ret;
 }
 
+static void clear_helper(struct dev_context *devc)
+{
+	g_mutex_clear(&devc->transfers_mutex);
+}
+
+static int dev_clear(const struct sr_dev_driver *di)
+{
+	return std_dev_clear_with_callback(di,
+					   (std_dev_clear_callback)clear_helper);
+}
+
 static struct sr_dev_driver sipeed_slogic_analyzer_driver_info = {
 	.name = "sipeed-slogic-analyzer",
 	.longname = "Sipeed SLogic Analyzer",
@@ -667,7 +679,7 @@ static struct sr_dev_driver sipeed_slogic_analyzer_driver_info = {
 	.cleanup = std_cleanup,
 	.scan = scan,
 	.dev_list = std_dev_list,
-	.dev_clear = std_dev_clear,
+	.dev_clear = dev_clear,
 	.config_channel_set = config_channel_set,
 	.config_get = config_get,
 	.config_set = config_set,
@@ -863,7 +875,13 @@ SR_PRIV int slogic_soft_trigger_raw_data(void *data, size_t len,
 			ret += remain;
 		}
 
-		devc->samples_got_nbytes += ret;
+		/*
+		 * Only account against the session-side counter here.
+		 * samples_got_nbytes belongs to the libusb event thread and
+		 * merely gates transfer submission; letting it run on from
+		 * zero over-submits by at most one transfer, which the
+		 * limit check in handle_events() then discards.
+		 */
 		devc->samples_sent_nbytes += ret;
 	} else {
 		/*
