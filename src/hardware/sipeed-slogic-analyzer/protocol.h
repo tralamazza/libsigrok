@@ -55,6 +55,9 @@ struct slogic_model {
 		int (*remote_reset)(const struct sr_dev_inst *sdi);
 		int (*remote_run)(const struct sr_dev_inst *sdi);
 		int (*remote_stop)(const struct sr_dev_inst *sdi);
+		/* NULL on models without the built-in test patterns. */
+		int (*remote_test_mode)(const struct sr_dev_inst *sdi,
+					uint32_t mode);
 	} operation;
 	void (*submit_raw_data)(void *data, size_t len,
 				const struct sr_dev_inst *sdi);
@@ -86,6 +89,14 @@ struct dev_context {
 
 		uint64_t samples_need_nbytes;
 		uint64_t samples_got_nbytes;
+		/*
+		 * Bytes actually passed on to the session. Only ever touched
+		 * from the session thread (handle_events() and the soft
+		 * trigger helper it calls), unlike samples_got_nbytes which
+		 * doubles as transfer flow control and is updated from the
+		 * libusb event thread.
+		 */
+		uint64_t samples_sent_nbytes;
 
 		uint64_t per_transfer_duration; /* unit: ms */
 		uint64_t per_transfer_nbytes;
@@ -116,5 +127,8 @@ struct dev_context {
 
 SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi);
 SR_PRIV int sipeed_slogic_acquisition_stop(struct sr_dev_inst *sdi);
+/* Returns the number of bytes sent to the session, or -1 if not triggered. */
+SR_PRIV int slogic_soft_trigger_raw_data(void *data, size_t len,
+					 const struct sr_dev_inst *sdi);
 
 #endif

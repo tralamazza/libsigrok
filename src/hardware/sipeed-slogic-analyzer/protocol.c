@@ -46,7 +46,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 
 	devc->num_transfers_used -= 1;
 	devc->num_transfers_completed += 1;
-	sr_spew("[%d] Transfer #%d status: %d(%s).",
+	sr_spew("[%zu] Transfer #%d status: %d(%s).",
 		devc->num_transfers_completed,
 		std_u64_idx(g_variant_new_uint64((uint64_t)transfer),
 			    (uint64_t *)devc->transfers, NUM_MAX_TRANSFERS),
@@ -65,7 +65,7 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 
 		// remove 32bit for hardware bug workaround
 		if (first_here) {
-			const size_t drop_bytes = 4;
+			const int drop_bytes = 4;
 			if (transfer->actual_length >= drop_bytes) {
 				transfer->actual_length -= drop_bytes;
 				memmove(transfer->buffer, transfer->buffer + drop_bytes,
@@ -75,13 +75,20 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 			}
 		}
 
-		if (devc->trigger_fired && transfer->actual_length >
-		    devc->samples_need_nbytes - devc->samples_got_nbytes)
-			transfer->actual_length = devc->samples_need_nbytes -
-						  devc->samples_got_nbytes;
+		if (devc->trigger_fired) {
+			uint64_t remaining =
+				devc->samples_need_nbytes >
+						devc->samples_got_nbytes ?
+					devc->samples_need_nbytes -
+						devc->samples_got_nbytes :
+					0;
+			if ((uint64_t)transfer->actual_length > remaining)
+				transfer->actual_length = remaining;
+		}
 		devc->samples_got_nbytes += transfer->actual_length;
 
-		sr_dbg("[%u] Got %u/%u(%.2f%%) => speed: %.2fMBps, %.2fMBps(avg), %.0fMBps(exp) => "
+		sr_dbg("[%zu] Got %" PRIu64 "/%" PRIu64
+		       "(%.2f%%) => speed: %.2fMBps, %.2fMBps(avg), %.0fMBps(exp) => "
 		       "+%.3f=%.3fms.",
 		       devc->num_transfers_completed, devc->samples_got_nbytes,
 		       devc->samples_need_nbytes,
@@ -106,7 +113,8 @@ static void LIBUSB_CALL receive_transfer(struct libusb_transfer *transfer)
 
 			uint8_t *ptr = malloc(devc->per_transfer_nbytes);
 			if (!ptr) {
-				sr_err("Failed to allocate memory: %u bytes!",
+				sr_err("Failed to allocate memory: %" PRIu64
+				       " bytes!",
 				       devc->per_transfer_nbytes);
 				devc->acq_aborted = 1;
 				break;
@@ -240,7 +248,8 @@ static int handle_events(int fd, int revents, void *cb_data)
 	}
 
 	if (!devc->raw_data_queue) {
-		sr_info("Bulk in %u/%u bytes with %u transfers.",
+		sr_info("Bulk in %" PRIu64 "/%" PRIu64
+			" bytes with %zu transfers.",
 			devc->samples_got_nbytes, devc->samples_need_nbytes,
 			devc->num_transfers_completed);
 		std_session_send_df_end(sdi);
@@ -250,16 +259,47 @@ static int handle_events(int fd, int revents, void *cb_data)
 		GByteArray *array = g_async_queue_try_pop(devc->raw_data_queue);
 		if (array != NULL) {
 			if (devc->trigger_fired) {
-				devc->model->submit_raw_data(
-					array->data, array->len, sdi);
-			} else if (devc->stl) {
-				extern int slogic_soft_trigger_raw_data(void *data, size_t len, const struct sr_dev_inst *sdi);
-				int sent_samples = slogic_soft_trigger_raw_data(array->data, array->len, sdi);
-				if (sent_samples) {
-					devc->trigger_fired = TRUE;
+				size_t len = array->len;
+
+				/*
+				 * Transfers that were queued before the
+				 * trigger fired never passed the length clamp
+				 * in receive_transfer(), which only applies
+				 * once trigger_fired is set. Enforce the
+				 * sample limit here as well, or that backlog
+				 * gets sent to the session in full.
+				 * samples_need_nbytes is 0 when running
+				 * continuously, i.e. without a limit.
+				 */
+				if (devc->samples_need_nbytes) {
+					uint64_t remaining =
+						devc->samples_need_nbytes >
+								devc->samples_sent_nbytes ?
+							devc->samples_need_nbytes -
+								devc->samples_sent_nbytes :
+							0;
+					if (len > remaining)
+						len = remaining;
 				}
+
+				if (len) {
+					devc->model->submit_raw_data(
+						array->data, len, sdi);
+					devc->samples_sent_nbytes += len;
+				}
+			} else if (devc->stl) {
+				/* Returns bytes sent, or -1 if not triggered yet. */
+				if (slogic_soft_trigger_raw_data(array->data,
+								 array->len,
+								 sdi) >= 0)
+					devc->trigger_fired = TRUE;
 			}
 			g_byte_array_unref(array);
+
+			if (devc->samples_need_nbytes &&
+			    devc->samples_sent_nbytes >=
+				    devc->samples_need_nbytes)
+				devc->acq_aborted = 1;
 		}
 	}
 
@@ -295,14 +335,15 @@ static int train_bulk_in_transfer(struct dev_context *devc,
 
 		uint8_t *transfer_buffer = malloc(try_transfer_nbytes);
 		if (!transfer_buffer) {
-			sr_dbg("Failed to allocate memory: %u bytes! Half it.",
+			sr_dbg("Failed to allocate memory: %" PRIu64
+			       " bytes! Half it.",
 			       try_transfer_nbytes);
 			try_transfer_nbytes >>= 1;
 			continue;
 		}
 
 		cur_transfer_duration = try_transfer_nbytes / BpMs;
-		sr_dbg("Train: receive %u bytes per %ums...",
+		sr_dbg("Train: receive %" PRIu64 " bytes per %" PRIu64 "ms...",
 		       try_transfer_nbytes, cur_transfer_duration);
 
 		libusb_fill_bulk_transfer(transfer, dev_handle,
@@ -338,8 +379,8 @@ static int train_bulk_in_transfer(struct dev_context *devc,
 		 ALIGN_SIZE); // 32kiB > 125ms * 1MHZ * 2ch
 
 	cur_transfer_duration = try_transfer_nbytes / BpMs;
-	sr_dbg("Choose: receive %u bytes per %ums :)", try_transfer_nbytes,
-	       cur_transfer_duration);
+	sr_dbg("Choose: receive %" PRIu64 " bytes per %" PRIu64 "ms :)",
+	       try_transfer_nbytes, cur_transfer_duration);
 
 	// Assign
 	devc->per_transfer_duration = cur_transfer_duration;
@@ -368,10 +409,12 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 	}
 
 	devc->samples_got_nbytes = 0;
+	devc->samples_sent_nbytes = 0;
 	devc->samples_need_nbytes =
 		devc->cur_limit_samples * devc->cur_samplechannel / 8;
-	sr_info("Need %ux %uch@%uMHz in %ums.", devc->cur_limit_samples,
-		devc->cur_samplechannel, devc->cur_samplerate / SR_MHZ(1),
+	sr_info("Need %" PRIu64 "x %dch@%" PRIu64 "MHz in %" PRIu64 "ms.",
+		devc->cur_limit_samples, devc->cur_samplechannel,
+		devc->cur_samplerate / SR_MHZ(1),
 		1000 * devc->cur_limit_samples / devc->cur_samplerate);
 
 	if ((ret = train_bulk_in_transfer(devc, usb->devhdl)) != SR_OK) {
@@ -398,14 +441,14 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		       devc->samples_need_nbytes) {
 		uint8_t *dev_buf = malloc(devc->per_transfer_nbytes);
 		if (!dev_buf) {
-			sr_dbg("Failed to allocate memory[%d]",
+			sr_dbg("Failed to allocate memory[%zu]",
 			       devc->num_transfers_used);
 			break;
 		}
 
 		struct libusb_transfer *transfer = libusb_alloc_transfer(0);
 		if (!transfer) {
-			sr_dbg("Failed to allocate transfer[%d]",
+			sr_dbg("Failed to allocate transfer[%zu]",
 			       devc->num_transfers_used);
 			free(dev_buf);
 			break;
@@ -413,7 +456,8 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 
 		libusb_fill_bulk_transfer(
 			transfer, usb->devhdl, devc->model->ep_in, dev_buf,
-			devc->per_transfer_nbytes, receive_transfer, sdi,
+			devc->per_transfer_nbytes, receive_transfer,
+			(void *)sdi,
 			(TRANSFERS_DURATION_TOLERANCE + 1) *
 				devc->per_transfer_duration *
 				(devc->num_transfers_used + 2));
@@ -422,7 +466,7 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		transfer->flags |= LIBUSB_TRANSFER_FREE_BUFFER;
 		ret = libusb_submit_transfer(transfer);
 		if (ret) {
-			sr_dbg("Failed to submit transfer[%d]: %s.",
+			sr_dbg("Failed to submit transfer[%zu]: %s.",
 			       devc->num_transfers_used,
 			       libusb_error_name(ret));
 			libusb_free_transfer(transfer);
@@ -432,7 +476,7 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->num_transfers_used += 1;
 	}
 	devc->timeout_count_limit = devc->num_transfers_used;
-	sr_dbg("Submited %u transfers", devc->num_transfers_used);
+	sr_dbg("Submited %zu transfers", devc->num_transfers_used);
 
 	if (!devc->num_transfers_used) {
 		return SR_ERR_IO;
@@ -448,7 +492,6 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 
 	devc->trigger_fired = TRUE;
 
-	devc->capture_ratio = 10;
 	struct sr_trigger *trigger = NULL;
 	/* Setup triggers */
 	if ((trigger = sr_session_trigger_get(sdi->session))) {
@@ -463,7 +506,8 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 
 	if ((ret = devc->model->operation.remote_run(sdi)) < 0) {
 		sr_err("Unhandled `CMD_RUN`");
-		sipeed_slogic_acquisition_stop(sdi);
+		/* Signature is fixed by the dev_acquisition_stop callback. */
+		sipeed_slogic_acquisition_stop((struct sr_dev_inst *)sdi);
 		return ret;
 	}
 

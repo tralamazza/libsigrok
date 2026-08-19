@@ -308,11 +308,13 @@ ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="608e", ENV{ID_SIGROK}="1"
 ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="608f", ENV{ID_SIGROK}="1"
 
 
-# Sipeed(359f) Slogic series
-# 0300: Slogic Lite 8
-# 3031: Slogic Basic 16 U3
+# Sipeed(359f) SLogic series
+# 0300: SLogic Combo 8
+# 3031: SLogic16U3
+# 3032: SLogic32U3
 ATTRS{idVendor}=="359f", ATTRS{idProduct}=="0300", ENV{ID_SIGROK}="1"
 ATTRS{idVendor}=="359f", ATTRS{idProduct}=="3031", ENV{ID_SIGROK}="1"
+ATTRS{idVendor}=="359f", ATTRS{idProduct}=="3032", ENV{ID_SIGROK}="1"
 
 # SiLabs CP210x (USB CDC) UART bridge, used (among others) in:
 # CEM DT-8852

@@ -35,7 +35,19 @@ static const uint32_t drvopts[] = {
 static const uint32_t devopts[] = {
 	SR_CONF_CONTINUOUS,
 	SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_CAPTURE_RATIO | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_PATTERN_MODE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
+	SR_CONF_VOLTAGE_THRESHOLD | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
+	SR_CONF_NUM_LOGIC_CHANNELS | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST
+};
+
+/* Same, minus SR_CONF_PATTERN_MODE, for models without test patterns. */
+static const uint32_t devopts_no_patterns[] = {
+	SR_CONF_CONTINUOUS,
+	SR_CONF_LIMIT_SAMPLES | SR_CONF_GET | SR_CONF_SET,
+	SR_CONF_CAPTURE_RATIO | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_SAMPLERATE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_TRIGGER_MATCH | SR_CONF_LIST,
 	SR_CONF_VOLTAGE_THRESHOLD | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
@@ -157,7 +169,7 @@ static const int32_t trigger_matches[] = {
 
 static struct sr_dev_driver sipeed_slogic_analyzer_driver_info;
 
-static struct slogic_model *const support_models_ptr;
+static const struct slogic_model *const support_models_ptr;
 
 static gpointer libusb_event_thread_func(gpointer user_data)
 {
@@ -188,17 +200,18 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	struct drv_context *drvc;
 	struct dev_context *devc;
 
-	struct slogic_model *model;
+	const struct slogic_model *model;
 	struct sr_config *option;
 	struct libusb_device_descriptor des;
 	GSList *devices;
 	GSList *l, *conn_devices;
-	const char *conn;
+	const char *conn_opt;
+	char *conn;
 	char cbuf[128];
 	char *iManufacturer, *iProduct, *iSerialNumber, *iPortPath;
 
 	struct sr_channel *ch;
-	unsigned int i;
+	int32_t i;
 	gchar *channel_name;
 
 	(void)options;
@@ -215,8 +228,8 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		option = l->data;
 		switch (option->key) {
 		case SR_CONF_CONN:
-			conn = g_variant_get_string(option->data, NULL);
-			sr_info("Use conn: %s", conn);
+			conn_opt = g_variant_get_string(option->data, NULL);
+			sr_info("Use conn: %s", conn_opt);
 			sr_err("Not supported now!");
 			return NULL;
 			break;
@@ -238,14 +251,17 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				libusb_get_device(usb->devhdl), &des);
 			libusb_get_string_descriptor_ascii(usb->devhdl,
 							   des.iManufacturer,
-							   cbuf, sizeof(cbuf));
+							   (unsigned char *)cbuf,
+							   sizeof(cbuf));
 			iManufacturer = g_strdup(cbuf);
 			libusb_get_string_descriptor_ascii(
-				usb->devhdl, des.iProduct, cbuf, sizeof(cbuf));
+				usb->devhdl, des.iProduct,
+				(unsigned char *)cbuf, sizeof(cbuf));
 			iProduct = g_strdup(cbuf);
 			libusb_get_string_descriptor_ascii(usb->devhdl,
 							   des.iSerialNumber,
-							   cbuf, sizeof(cbuf));
+							   (unsigned char *)cbuf,
+							   sizeof(cbuf));
 			iSerialNumber = g_strdup(cbuf);
 			usb_get_port_path(libusb_get_device(usb->devhdl), cbuf,
 					  sizeof(cbuf));
@@ -276,6 +292,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 					devc->limit_samplechannel;
 				devc->cur_samplerate = devc->limit_samplerate;
 				devc->cur_pattern_mode_idx = PATTERN_MODE_NORMAL;
+				devc->capture_ratio = 10;
 				devc->voltage_threshold[0] =
 					devc->voltage_threshold[1] = 1.7000000000000004;
 
@@ -284,7 +301,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				for (i = 0; i < devc->limit_samplechannel;
 				     i++) {
 					channel_name =
-						g_strdup_printf("D%u", i);
+						g_strdup_printf("D%d", i);
 					ch = sr_channel_new(sdi, i,
 							    SR_CHANNEL_LOGIC,
 							    TRUE, channel_name);
@@ -356,11 +373,14 @@ static int dev_open(struct sr_dev_inst *sdi)
 	if (devc->model->operation.remote_reset)
 		devc->model->operation.remote_reset(sdi);
 
-	devc->voltage_threshold[0] = devc->voltage_threshold[1] = 1.7000000000000004;
-
-	sr_config_set(sdi, NULL, SR_CONF_VOLTAGE_THRESHOLD,
-				g_variant_new("(dd)", &devc->voltage_threshold[0],
-			      &devc->voltage_threshold[1]));
+	/*
+	 * Set the default threshold directly. Calling sr_config_set() here
+	 * cannot work: sr_dev_open() only marks the instance SR_ST_ACTIVE
+	 * after this function returns, so the call is rejected and merely
+	 * logs an error. config_set() would not touch the hardware either,
+	 * the threshold is programmed at acquisition start.
+	 */
+	devc->voltage_threshold[0] = devc->voltage_threshold[1] = 1.7;
 
 	return std_dummy_dev_open(sdi);
 }
@@ -370,13 +390,9 @@ static int dev_close(struct sr_dev_inst *sdi)
 	int ret;
 	struct sr_usb_dev_inst *usb;
 	struct dev_context *devc;
-	struct sr_dev_driver *di;
-	struct drv_context *drvc;
 
 	usb = sdi->conn;
 	devc = sdi->priv;
-	di = sdi->driver;
-	drvc = di->context;
 
 	ret = libusb_release_interface(usb->devhdl, 0);
 	if (ret != LIBUSB_SUCCESS) {
@@ -432,6 +448,9 @@ static int config_get(uint32_t key, GVariant **data,
 		*data = std_gvar_tuple_double(devc->voltage_threshold[0],
 					      devc->voltage_threshold[1]);
 		break;
+	case SR_CONF_CAPTURE_RATIO:
+		*data = g_variant_new_uint64(devc->capture_ratio);
+		break;
 	default:
 		return SR_ERR_NA;
 	}
@@ -443,7 +462,8 @@ static int config_set(uint32_t key, GVariant *data,
 		      const struct sr_dev_inst *sdi,
 		      const struct sr_channel_group *cg)
 {
-	int ret;
+	int ret, idx;
+	uint64_t capture_ratio;
 	struct dev_context *devc;
 
 	(void)cg;
@@ -456,7 +476,7 @@ static int config_set(uint32_t key, GVariant *data,
 		if (g_variant_get_uint64(data) > devc->limit_samplerate ||
 		    std_u64_idx(data, devc->model->samplerate_table, devc->model->samplerate_table_size) < 0) {
 			devc->cur_samplerate = devc->limit_samplerate;
-			sr_warn("Reach limit or not supported, wrap to %uMHz.",
+			sr_warn("Reach limit or not supported, wrap to %" PRIu64 "MHz.",
 				devc->limit_samplerate / SR_MHZ(1));
 		} else {
 			devc->cur_samplerate = g_variant_get_uint64(data);
@@ -502,27 +522,37 @@ static int config_set(uint32_t key, GVariant *data,
 		}
 		break;
 	case SR_CONF_PATTERN_MODE:
-		devc->cur_pattern_mode_idx =
-			std_str_idx(data, ARRAY_AND_SIZE(patterns));
-		if (devc->cur_pattern_mode_idx < 0)
-			devc->cur_pattern_mode_idx = 0;
-		if (devc->model == &support_models_ptr[0]) {
-			sr_warn("unsupported model: %s.", devc->model->name);
-			break;
+		/*
+		 * Report the option as unavailable instead of accepting a
+		 * value that would then be silently ignored.
+		 */
+		if (!devc->model->operation.remote_test_mode) {
+			sr_dbg("%s has no test patterns.", devc->model->name);
+			return SR_ERR_NA;
 		}
+		idx = std_str_idx(data, ARRAY_AND_SIZE(patterns));
+		if (idx < 0)
+			return SR_ERR_ARG;
+		devc->cur_pattern_mode_idx = idx;
 		if (devc->cur_pattern_mode_idx == PATTERN_MODE_NORMAL) {
 			if (devc->model->operation.remote_reset)
 				devc->model->operation.remote_reset(sdi);
-			slogic16U3_remote_test_mode(sdi, 0x0);
+			devc->model->operation.remote_test_mode(sdi, 0x0);
 			sr_dbg("reset model: %s success.", devc->model->name);
 		} else if (devc->cur_pattern_mode_idx == PATTERN_MODE_TEST_HARDWARE_USB_MAX_SPEED) {
-			slogic16U3_remote_test_mode(sdi, 0x1);
+			devc->model->operation.remote_test_mode(sdi, 0x1);
 		} else if (devc->cur_pattern_mode_idx == PATTERN_MODE_TEST_HARDWARE_EMU_DATA) {
-			slogic16U3_remote_test_mode(sdi, 0x2);
+			devc->model->operation.remote_test_mode(sdi, 0x2);
 		}
 		break;
 	case SR_CONF_LIMIT_SAMPLES:
 		devc->cur_limit_samples = g_variant_get_uint64(data);
+		break;
+	case SR_CONF_CAPTURE_RATIO:
+		capture_ratio = g_variant_get_uint64(data);
+		if (capture_ratio > 100)
+			return SR_ERR_ARG;
+		devc->capture_ratio = capture_ratio;
 		break;
 	case SR_CONF_VOLTAGE_THRESHOLD:
 		g_variant_get(data, "(dd)", &devc->voltage_threshold[0],
@@ -535,7 +565,11 @@ static int config_set(uint32_t key, GVariant *data,
 	return ret;
 }
 
-int config_channel_set(const struct sr_dev_inst *sdi, struct sr_channel *ch, unsigned int changes) {
+static int config_channel_set(const struct sr_dev_inst *sdi,
+		struct sr_channel *ch, unsigned int changes)
+{
+	(void)ch;
+
 	struct dev_context *devc = sdi ? (sdi->priv) : NULL;
 	if(!devc || !devc->model || !devc->model->samplechannel_table || !devc->model->limit_samplerate_table){
 		return SR_ERR;
@@ -586,8 +620,14 @@ static int config_list(uint32_t key, GVariant **data,
 	switch (key) {
 	case SR_CONF_SCAN_OPTIONS:
 	case SR_CONF_DEVICE_OPTIONS:
-		ret = STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts,
-				      devopts);
+		if (devc && !devc->model->operation.remote_test_mode)
+			ret = std_opts_config_list(
+				key, data, sdi, cg, ARRAY_AND_SIZE(scanopts),
+				ARRAY_AND_SIZE(drvopts),
+				ARRAY_AND_SIZE(devopts_no_patterns));
+		else
+			ret = STD_CONFIG_LIST(key, data, sdi, cg, scanopts,
+					      drvopts, devopts);
 		break;
 	case SR_CONF_SAMPLERATE:
 		*data = std_gvar_samplerates(
@@ -602,6 +642,8 @@ static int config_list(uint32_t key, GVariant **data,
 		*data = std_gvar_array_i32(devc->model->samplechannel_table, devc->model->samplechannel_table_size);
 		break;
 	case SR_CONF_PATTERN_MODE:
+		if (!devc->model->operation.remote_test_mode)
+			return SR_ERR_NA;
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(patterns));
 		break;
 	case SR_CONF_TRIGGER_MATCH:
@@ -640,26 +682,24 @@ SR_REGISTER_DEV_DRIVER(sipeed_slogic_analyzer_driver_info);
 
 static int slogic_usb_control_write(const struct sr_dev_inst *sdi,
 				    uint8_t request, uint16_t value,
-				    uint16_t index, uint8_t *data, size_t len,
-				    int timeout)
+				    uint16_t index, const uint8_t *data,
+				    size_t len, int timeout)
 {
 	int ret;
-	struct dev_context *devc;
 	struct sr_usb_dev_inst *usb;
 
-	devc = sdi->priv;
 	usb = sdi->conn;
 
-	sr_spew("%s: req:%u value:%u index:%u %p:%u in %dms.", __func__,
-		request, value, index, data, len, timeout);
+	sr_spew("%s: req:%u value:%u index:%u %p:%zu in %dms.", __func__,
+		request, value, index, (const void *)data, len, timeout);
 	if (!data && len) {
-		sr_warn("%s: Nothing to write although len(%u)>0!", __func__,
+		sr_warn("%s: Nothing to write although len(%zu)>0!", __func__,
 			len);
 		len = 0;
 	} else if (len & 0x3) {
 		size_t len_aligndup = (len + 0x3) & (~0x3);
-		sr_warn("%s: Align up to %u(from %u)!", __func__, len_aligndup,
-			len);
+		sr_warn("%s: Align up to %zu(from %zu)!", __func__,
+			len_aligndup, len);
 		len = len_aligndup;
 	}
 
@@ -668,8 +708,8 @@ static int slogic_usb_control_write(const struct sr_dev_inst *sdi,
 		ret += libusb_control_transfer(
 			usb->devhdl,
 			LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT,
-			request, value + i, index, (unsigned char *)data + i, 4,
-			timeout);
+			request, value + i, index,
+			(unsigned char *)(data + i), 4, timeout);
 		if (ret < 0) {
 			sr_err("%s: failed(libusb: %s)!", __func__,
 			       libusb_error_name(ret));
@@ -686,22 +726,20 @@ static int slogic_usb_control_read(const struct sr_dev_inst *sdi,
 				   int timeout)
 {
 	int ret;
-	struct dev_context *devc;
 	struct sr_usb_dev_inst *usb;
 
-	devc = sdi->priv;
 	usb = sdi->conn;
 
-	sr_spew("%s: req:%u value:%u index:%u %p:%u in %dms.", __func__,
-		request, value, index, data, len, timeout);
+	sr_spew("%s: req:%u value:%u index:%u %p:%zu in %dms.", __func__,
+		request, value, index, (void *)data, len, timeout);
 	if (!data && len) {
-		sr_err("%s: Can't read to NULL while len(%u)>0!", __func__,
+		sr_err("%s: Can't read to NULL while len(%zu)>0!", __func__,
 		       len);
 		return SR_ERR_ARG;
 	} else if (len & 0x3) {
 		size_t len_aligndup = (len + 0x3) & (~0x3);
-		sr_warn("%s: Align up to %u(from %u)!", __func__, len_aligndup,
-			len);
+		sr_warn("%s: Align up to %zu(from %zu)!", __func__,
+			len_aligndup, len);
 		len = len_aligndup;
 	}
 
@@ -757,8 +795,8 @@ static void slogic_submit_raw_data(void *data, size_t len,
 		free(ptr);
 }
 
-int slogic_soft_trigger_raw_data(void *data, size_t len,
-				   const struct sr_dev_inst *sdi)
+SR_PRIV int slogic_soft_trigger_raw_data(void *data, size_t len,
+					 const struct sr_dev_inst *sdi)
 {
 	int ret = 0;
 	struct dev_context *devc = sdi->priv;
@@ -795,15 +833,25 @@ int slogic_soft_trigger_raw_data(void *data, size_t len,
 	devc->stl->unitsize = uintsize;
 	int64_t trigger_offset = soft_trigger_logic_check(devc->stl, ptr, len, &pre_trigger_samples);
 	if (trigger_offset > -1) {
+		/* soft_trigger_logic_check() already sent the pre-trigger data. */
 		ret += pre_trigger_samples * uintsize;
 
-		int need = devc->samples_need_nbytes - devc->samples_got_nbytes - ret;
+		uint64_t remain = len - trigger_offset * uintsize;
 
-		if (need > 0) {
-			int remain = len - trigger_offset * uintsize;
-			if (need < remain)
+		/*
+		 * A zero samples_need_nbytes means acquisition runs without a
+		 * sample limit, so everything from the trigger on is wanted.
+		 */
+		if (devc->samples_need_nbytes) {
+			uint64_t sent = devc->samples_sent_nbytes + ret;
+			uint64_t need = devc->samples_need_nbytes > sent ?
+						devc->samples_need_nbytes - sent :
+						0;
+			if (remain > need)
 				remain = need;
+		}
 
+		if (remain) {
 			sr_session_send(sdi, &(struct sr_datafeed_packet){
 						.type = SR_DF_LOGIC,
 						.payload = &(struct sr_datafeed_logic){
@@ -816,6 +864,15 @@ int slogic_soft_trigger_raw_data(void *data, size_t len,
 		}
 
 		devc->samples_got_nbytes += ret;
+		devc->samples_sent_nbytes += ret;
+	} else {
+		/*
+		 * Report "not triggered" distinctly. Returning the byte count
+		 * alone cannot express this: a trigger that matches with no
+		 * pre-trigger data and nothing left to send is a valid hit
+		 * that yields zero bytes.
+		 */
+		ret = -1;
 	}
 
 	if (nCh < 8)
@@ -888,8 +945,6 @@ static int slogic_combo8_remote_run(const struct sr_dev_inst *sdi)
 
 static int slogic_combo8_remote_stop(const struct sr_dev_inst *sdi)
 {
-	struct dev_context *devc = sdi->priv;
-	struct sr_usb_dev_inst *usb = sdi->conn;
 	clear_ep(sdi);
 	return SR_OK;
 	/* not stable, but can be ignored */
@@ -907,7 +962,6 @@ static int slogic_combo8_remote_stop(const struct sr_dev_inst *sdi)
 #define SLOGIC16U3_R32_AUX 0x000c
 
 static int slogic16U3_remote_test_mode(const struct sr_dev_inst *sdi, uint32_t mode) {
-	struct dev_context *devc = sdi->priv;
 	uint8_t cmd_aux[64] = { 0 }; // configure aux
 
 	{
@@ -922,7 +976,7 @@ static int slogic16U3_remote_test_mode(const struct sr_dev_inst *sdi, uint32_t m
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 				SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4, 500);
-			sr_dbg("[%u]read aux testmode: %08x.", retry,
+			sr_dbg("[%zu]read aux testmode: %08x.", retry,
 			       ((uint32_t *)cmd_aux)[0]);
 			retry += 1;
 			if (retry > 5)
@@ -963,7 +1017,6 @@ static int slogic16U3_remote_test_mode(const struct sr_dev_inst *sdi, uint32_t m
 }
 
 static int slogic16U3_remote_reset(const struct sr_dev_inst *sdi) {
-	struct dev_context *devc = sdi->priv;
 	const uint8_t cmd_rst[] = { 0x02, 0x00, 0x00, 0x00 };
 	const uint8_t cmd_derst[] = { 0x00, 0x00, 0x00, 0x00 };
 
@@ -994,7 +1047,7 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 				SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4, 500);
-			sr_dbg("[%u]read aux channel: %08x.", retry,
+			sr_dbg("[%zu]read aux channel: %08x.", retry,
 			       ((uint32_t *)cmd_aux)[0]);
 			retry += 1;
 			if (retry > 5)
@@ -1043,7 +1096,7 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 				SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4, 500);
-			sr_dbg("[%u]read aux samplerate: %08x.", retry,
+			sr_dbg("[%zu]read aux samplerate: %08x.", retry,
 			       ((uint32_t *)cmd_aux)[0]);
 			retry += 1;
 			if (retry > 5)
@@ -1065,7 +1118,7 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 			uint64_t base =
 				SR_MHZ(1) * ((uint16_t *)(cmd_aux + 4))[1];
 			if (base % devc->cur_samplerate) {
-				sr_dbg("Failed to configure samplerate from base[%u] %u.",
+				sr_dbg("Failed to configure samplerate from base[%u] %" PRIu64 ".",
 				       ((uint16_t *)(cmd_aux + 4))[0], base);
 				((uint16_t *)(cmd_aux + 4))[0] += 1;
 				slogic_usb_control_write(
@@ -1117,7 +1170,7 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 			slogic_usb_control_read(
 				sdi, SLOGIC16U3_CONTROL_IN_REQ_REG_READ,
 				SLOGIC16U3_R32_AUX, 0x0000, cmd_aux, 4, 500);
-			sr_dbg("[%u]read vref(/1024x1v6): %08x.", retry,
+			sr_dbg("[%zu]read vref(/1024x1v6): %08x.", retry,
 			       ((uint32_t *)cmd_aux)[0]);
 			retry += 1;
 			if (retry > 5)
@@ -1133,10 +1186,11 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 
 		sr_dbg("aux rd: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
 
-		((uint32_t *)(cmd_aux + 4))[0] =
+		uint32_t vref_code =
 			(uint32_t)((devc->voltage_threshold[0] +
 				    devc->voltage_threshold[1]) /
 				   2 / 3.33 / 2 * 1024);
+		((uint32_t *)(cmd_aux + 4))[0] = vref_code;
 
 		sr_dbg("aux wr: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
 		slogic_usb_control_write(sdi,
@@ -1151,8 +1205,15 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 					(*(uint16_t *)cmd_aux) >> 9, 500);
 		sr_dbg("aux rd: %08x %08x.", ((uint32_t *)cmd_aux)[0], ((uint32_t *)(cmd_aux + 4))[0]);
 
-		if (1024 != *(uint32_t *)(cmd_aux + 4)) {
-			sr_dbg("Failed to configure vref.");
+		/*
+		 * Compare against what was written, not against a fixed 1024.
+		 * A readback of 1024 corresponds to a 6.66V threshold, which
+		 * is outside the advertised 0-6V range, so the fixed
+		 * comparison reported failure for every valid setting.
+		 */
+		if (vref_code != *(uint32_t *)(cmd_aux + 4)) {
+			sr_dbg("Failed to configure vref: wrote %u, read back %u.",
+			       vref_code, *(uint32_t *)(cmd_aux + 4));
 		} else {
 			sr_dbg("Succeed to configure vref.");
 		}
@@ -1176,7 +1237,7 @@ static int slogic16U3_remote_stop(const struct sr_dev_inst *sdi)
 
 static const struct slogic_model support_models[] = {
     {
-        .name = "Sogic Combo 8",
+        .name = "SLogic Combo 8",
         .pid = 0x0300,
         .ep_in = 0x01 | LIBUSB_ENDPOINT_IN,
         .max_bandwidth = SR_MHZ(320),
@@ -1190,6 +1251,8 @@ static const struct slogic_model support_models[] = {
                 .remote_reset = NULL,
                 .remote_run = slogic_combo8_remote_run,
                 .remote_stop = slogic_combo8_remote_stop,
+                /* No built-in test patterns on this model. */
+                .remote_test_mode = NULL,
             },
         .submit_raw_data = slogic_submit_raw_data,
     },
@@ -1208,6 +1271,7 @@ static const struct slogic_model support_models[] = {
                 .remote_reset = slogic16U3_remote_reset,
                 .remote_run = slogic16U3_remote_run,
                 .remote_stop = slogic16U3_remote_stop,
+                .remote_test_mode = slogic16U3_remote_test_mode,
             },
         .submit_raw_data = slogic_submit_raw_data,
     },
@@ -1226,6 +1290,7 @@ static const struct slogic_model support_models[] = {
                 .remote_reset = slogic16U3_remote_reset,
                 .remote_run = slogic16U3_remote_run,
                 .remote_stop = slogic16U3_remote_stop,
+                .remote_test_mode = slogic16U3_remote_test_mode,
             },
         .submit_raw_data = slogic_submit_raw_data,
     },
@@ -1234,4 +1299,4 @@ static const struct slogic_model support_models[] = {
         .pid = 0x0000,
     }};
 
-static struct slogic_model *const support_models_ptr = &support_models[0];
+static const struct slogic_model *const support_models_ptr = &support_models[0];
