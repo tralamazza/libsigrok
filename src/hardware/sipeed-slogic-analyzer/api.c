@@ -55,7 +55,7 @@ static const uint32_t devopts_no_patterns[] = {
 };
 
 static const uint64_t samplerates_slogiccombo8[] = {
-	/** 
+	/**
 	 * SLogic Combo 8 (USBHS 480Mbps bw: 40MB/s)
 	 *  160M = 2^5*5^1  M
 	*/
@@ -127,7 +127,7 @@ static const uint64_t samplerates_slogic16u3[] = {
 };
 
 static const int32_t samplechannels_slogic16u3[] = { /*2, */4, 8, 16 };
-static const uint64_t limit_samplerates_slogic16u3[] = 
+static const uint64_t limit_samplerates_slogic16u3[] =
 #ifdef _WIN32
 	{ /*SR_MHZ(1500), */SR_MHZ(400), SR_MHZ(200), SR_MHZ(100) };
 #else
@@ -153,7 +153,7 @@ static const uint64_t samplerates_slogic32u3[] = {
 	SR_MHZ(1600),
 };
 static const int32_t samplechannels_slogic32u3[] = { /*2, */4, 8, 16 , 32 };
-static const uint64_t limit_samplerates_slogic32u3[] = 
+static const uint64_t limit_samplerates_slogic32u3[] =
 	{ SR_MHZ(1600), SR_MHZ(800), SR_MHZ(400), SR_MHZ(200) };
 
 static const char *patterns[] = {
@@ -190,6 +190,54 @@ static gpointer libusb_event_thread_func(gpointer user_data)
 	}
 
 	return NULL;
+}
+
+/*
+ * std_u64_idx() and std_i32_idx() do not take ownership of the GVariant
+ * they are given, so handing them a freshly created one leaks it. Search
+ * the tables directly instead.
+ */
+static int u64_idx(uint64_t value, const uint64_t *arr, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (arr[i] == value)
+			return i;
+	}
+
+	return -1;
+}
+
+static int i32_idx(int32_t value, const int32_t *arr, size_t n)
+{
+	for (size_t i = 0; i < n; i++) {
+		if (arr[i] == value)
+			return i;
+	}
+
+	return -1;
+}
+
+/*
+ * Read a USB string descriptor into buf and return a copy of it, or NULL
+ * if the descriptor is absent or cannot be read.
+ */
+static char *read_string_descriptor(libusb_device_handle *devhdl, uint8_t idx,
+				    char *buf, size_t buflen)
+{
+	int ret;
+
+	if (!idx)
+		return NULL;
+
+	ret = libusb_get_string_descriptor_ascii(devhdl, idx,
+						 (unsigned char *)buf, buflen);
+	if (ret < 0) {
+		sr_dbg("Failed to read string descriptor %u: %s.", idx,
+		       libusb_error_name(ret));
+		return NULL;
+	}
+
+	return g_strdup(buf);
 }
 
 static GSList *scan(struct sr_dev_driver *di, GSList *options)
@@ -232,7 +280,6 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 			sr_info("Use conn: %s", conn_opt);
 			sr_err("Not supported now!");
 			return NULL;
-			break;
 		default:
 			sr_warn("Unhandled option key: %u", option->key);
 		}
@@ -245,24 +292,27 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 		for (l = conn_devices; l; l = l->next) {
 			usb = l->data;
 			ret = sr_usb_open(drvc->sr_ctx->libusb_ctx, usb);
-			if (SR_OK != ret)
+			if (SR_OK != ret) {
+				sr_usb_dev_inst_free(usb);
+				l->data = NULL;
 				continue;
+			}
 			libusb_get_device_descriptor(
 				libusb_get_device(usb->devhdl), &des);
-			libusb_get_string_descriptor_ascii(usb->devhdl,
-							   des.iManufacturer,
-							   (unsigned char *)cbuf,
-							   sizeof(cbuf));
-			iManufacturer = g_strdup(cbuf);
-			libusb_get_string_descriptor_ascii(
-				usb->devhdl, des.iProduct,
-				(unsigned char *)cbuf, sizeof(cbuf));
-			iProduct = g_strdup(cbuf);
-			libusb_get_string_descriptor_ascii(usb->devhdl,
-							   des.iSerialNumber,
-							   (unsigned char *)cbuf,
-							   sizeof(cbuf));
-			iSerialNumber = g_strdup(cbuf);
+			/*
+			 * cbuf is left untouched when a descriptor read
+			 * fails, so check every result. Otherwise the
+			 * previous string, or uninitialised stack on the
+			 * first read, ends up in the device instance.
+			 */
+			iManufacturer = read_string_descriptor(
+				usb->devhdl, des.iManufacturer, cbuf,
+				sizeof(cbuf));
+			iProduct = read_string_descriptor(
+				usb->devhdl, des.iProduct, cbuf, sizeof(cbuf));
+			iSerialNumber = read_string_descriptor(
+				usb->devhdl, des.iSerialNumber, cbuf,
+				sizeof(cbuf));
 			usb_get_port_path(libusb_get_device(usb->devhdl), cbuf,
 					  sizeof(cbuf));
 			iPortPath = g_strdup(cbuf);
@@ -285,7 +335,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				devc->limit_samplechannel = devc->model->samplechannel_table[
 					devc->model->samplechannel_table_size - 1];
 				devc->limit_samplerate = devc->model->limit_samplerate_table[
-					std_i32_idx(g_variant_new_int32(devc->limit_samplechannel),
+					i32_idx(devc->limit_samplechannel,
 						devc->model->samplechannel_table, devc->model->samplechannel_table_size)
 				];
 
@@ -295,7 +345,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 				devc->cur_pattern_mode_idx = PATTERN_MODE_NORMAL;
 				devc->capture_ratio = 10;
 				devc->voltage_threshold[0] =
-					devc->voltage_threshold[1] = 1.7000000000000004;
+					devc->voltage_threshold[1] = 1.7;
 
 				devc->digital_group =
 					sr_channel_group_new(sdi, "LA", NULL);
@@ -320,7 +370,11 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 			sr_usb_close(usb);
 			devices = g_slist_append(devices, sdi);
 		}
-		// g_slist_free_full(conn_devices, (GDestroyNotify)sr_usb_dev_inst_free);
+		/*
+		 * The sr_usb_dev_inst of a device that was kept is now owned
+		 * by its sdi, so only the list itself may be freed here.
+		 */
+		g_slist_free(conn_devices);
 		g_free(conn);
 	}
 
@@ -439,6 +493,9 @@ static int config_get(uint32_t key, GVariant **data,
 		*data = g_variant_new_int32(devc->cur_samplechannel);
 		break;
 	case SR_CONF_PATTERN_MODE:
+		/* Not listed on models without the built-in test patterns. */
+		if (!devc->model->operation.remote_test_mode)
+			return SR_ERR_NA;
 		*data = g_variant_new_string(
 			patterns[devc->cur_pattern_mode_idx]);
 		break;
@@ -496,7 +553,7 @@ static int config_set(uint32_t key, GVariant *data,
 			devc->cur_samplechannel = g_variant_get_int32(data);
 
 			devc->limit_samplerate = devc->model->limit_samplerate_table[
-				std_i32_idx(g_variant_new_int32(devc->cur_samplechannel),
+				i32_idx(devc->cur_samplechannel,
 					devc->model->samplechannel_table, devc->model->samplechannel_table_size)
 			];
 
@@ -508,7 +565,7 @@ static int config_set(uint32_t key, GVariant *data,
 			for (GSList *l = devc->digital_group->channels; l;
 			     l = l->next) {
 				struct sr_channel *ch = l->data;
-				if (ch->type == 
+				if (ch->type ==
 					SR_CHANNEL_LOGIC) { /* Might as well do this now, these
                                                are static. */
 					ch->enabled = ch->index >= devc->cur_samplechannel ? FALSE : TRUE;
@@ -575,11 +632,11 @@ static int config_channel_set(const struct sr_dev_inst *sdi,
 	if(!devc || !devc->model || !devc->model->samplechannel_table || !devc->model->limit_samplerate_table){
 		return SR_ERR;
 	}
-	
+
 	if(changes != SR_CHANNEL_SET_ENABLED){
 		return SR_OK;
 	}
-	
+
 	int32_t new_samplechannel = devc->model->samplechannel_table[0];
 	for (GSList *l = devc->digital_group->channels; l;l = l->next) {
 		struct sr_channel *ch = l->data;
@@ -597,7 +654,7 @@ static int config_channel_set(const struct sr_dev_inst *sdi,
 	if(new_samplechannel > devc->cur_samplechannel){
 		devc->cur_samplechannel = new_samplechannel;
 		devc->limit_samplerate = devc->model->limit_samplerate_table[
-				std_i32_idx(g_variant_new_int32(devc->cur_samplechannel),
+				i32_idx(devc->cur_samplechannel,
 					devc->model->samplechannel_table, devc->model->samplechannel_table_size)
 			];
 		if (devc->cur_samplerate > devc->limit_samplerate)
@@ -617,6 +674,15 @@ static int config_list(uint32_t key, GVariant **data,
 
 	devc = sdi ? (sdi->priv) : NULL;
 
+	/*
+	 * Only the option lists can be queried without a device. Every other
+	 * key below reads the model, so reject those early rather than after
+	 * having already dereferenced it.
+	 */
+	if (key != SR_CONF_SCAN_OPTIONS && key != SR_CONF_DEVICE_OPTIONS &&
+	    (!devc || !devc->model))
+		return SR_ERR_ARG;
+
 	ret = SR_OK;
 	switch (key) {
 	case SR_CONF_SCAN_OPTIONS:
@@ -633,11 +699,8 @@ static int config_list(uint32_t key, GVariant **data,
 	case SR_CONF_SAMPLERATE:
 		*data = std_gvar_samplerates(
 			devc->model->samplerate_table,
-			1 + std_u64_idx(g_variant_new_uint64(
-						devc->limit_samplerate),
+			1 + u64_idx(devc->limit_samplerate,
 					devc->model->samplerate_table, devc->model->samplerate_table_size));
-		if (NULL == devc->model)
-			ret = SR_ERR_ARG;
 		break;
 	case SR_CONF_NUM_LOGIC_CHANNELS:
 		*data = std_gvar_array_i32(devc->model->samplechannel_table, devc->model->samplechannel_table_size);
