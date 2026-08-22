@@ -1360,11 +1360,52 @@ static int slogic16U3_remote_run(const struct sr_dev_inst *sdi)
 
 		sr_dbg("aux rd: %08x %08x.", aux.u32[0], aux.u32[1]);
 
-		uint32_t vref_code =
-			(uint32_t)((devc->voltage_threshold[0] +
-				    devc->voltage_threshold[1]) /
-				   2 / 3.33 / 2 * 1024);
+		/*
+		 * Map the requested threshold to a vref DAC code.
+		 *
+		 * The original expression here was code = V / 6.66 * 1024,
+		 * i.e. a 6.66V full scale passing through the origin. Measured
+		 * against a lab supply on an SLogic16 U3 (S/N 202512261505),
+		 * the real transfer function has both a smaller slope and a
+		 * non-zero intercept:
+		 *
+		 *     threshold = 0.005166 * code + 0.4318   volts
+		 *
+		 * Three calibration points (1.005V, 2.000V and 3.303V applied,
+		 * crossovers found by bisecting the requested threshold) fit
+		 * that line to within 13mV, and it independently predicted a
+		 * 3.32V logic high crossing at 3.638V against 3.643V measured.
+		 * Under the old formula a 3.3V input needed a 3.64V request,
+		 * a 10% error that pushed a 3.3V logic high near the top of
+		 * the usable range.
+		 *
+		 * Linearity degrades above roughly 4V: a 4.003V input crossed
+		 * 116mV away from the fit, and a 5V input never crossed at all
+		 * before the DAC ran out of range. Thresholds beyond ~4V are
+		 * therefore approximate. That is well clear of the 1.2-3.3V
+		 * logic families this hardware targets.
+		 *
+		 * NOTE: these constants come from one unit. Part-to-part
+		 * spread is unmeasured, so this is not necessarily right for
+		 * every SLogic16 U3 - but the *form* of the old expression was
+		 * wrong for all of them, since it has no intercept term.
+		 */
+		const double vref_slope = 0.005166;	/* volts per LSB */
+		const double vref_offset = 0.4318;	/* volts at code 0 */
+		const double vref_want = (devc->voltage_threshold[0] +
+					  devc->voltage_threshold[1]) / 2;
+		double vref_raw = (vref_want - vref_offset) / vref_slope;
+
+		if (vref_raw < 0)
+			vref_raw = 0;
+		else if (vref_raw > 1023)
+			vref_raw = 1023;
+
+		uint32_t vref_code = (uint32_t)(vref_raw + 0.5);
 		aux.u32[1] = vref_code;
+		sr_dbg("vref: want %.3fV -> code %u (%.3fV achieved).",
+		       vref_want, vref_code,
+		       vref_slope * vref_code + vref_offset);
 
 		sr_dbg("aux wr: %08x %08x.", aux.u32[0], aux.u32[1]);
 		slogic_usb_control_write(sdi,
