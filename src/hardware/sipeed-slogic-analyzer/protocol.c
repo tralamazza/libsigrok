@@ -484,6 +484,18 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 	devc->samples_sent_nbytes = 0;
 	devc->samples_need_nbytes =
 		devc->cur_limit_samples * devc->cur_samplechannel / 8;
+	/*
+	 * Warn here rather than in config_set(): a rate above the ceiling is
+	 * only final once the channel count is known, and the two arrive in an
+	 * order the driver does not control.
+	 */
+	if (devc->req_samplerate > devc->cur_samplerate)
+		sr_warn("Requested %" PRIu64 "MHz exceeds the %dch ceiling; "
+			"capturing at %" PRIu64 "MHz.",
+			devc->req_samplerate / SR_MHZ(1),
+			devc->cur_samplechannel,
+			devc->cur_samplerate / SR_MHZ(1));
+
 	sr_info("Need %" PRIu64 "x %dch@%" PRIu64 "MHz in %" PRIu64 "ms.",
 		devc->cur_limit_samples, devc->cur_samplechannel,
 		devc->cur_samplerate / SR_MHZ(1),

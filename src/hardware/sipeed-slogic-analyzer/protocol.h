@@ -75,6 +75,18 @@ struct dev_context {
 
 	struct {
 		uint64_t cur_limit_samples;
+		/*
+		 * req_samplerate is what the frontend last asked for;
+		 * cur_samplerate is that clamped to the ceiling for the channel
+		 * count currently selected. Both are needed because the two
+		 * settings arrive in an order the driver does not control:
+		 * sigrok-cli applies --config before it enables channels, so
+		 * clamping the request and forgetting it pinned the rate to the
+		 * 16-channel ceiling even for a capture that ends up 4-channel.
+		 * Keeping the request lets the ceiling be re-applied whenever
+		 * the channel count moves.
+		 */
+		uint64_t req_samplerate;
 		uint64_t cur_samplerate;
 		int32_t cur_samplechannel;
 		int64_t cur_pattern_mode_idx;

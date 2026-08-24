@@ -331,7 +331,8 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 
 				devc->cur_samplechannel =
 					devc->limit_samplechannel;
-				devc->cur_samplerate = devc->limit_samplerate;
+				devc->req_samplerate = devc->cur_samplerate =
+					devc->limit_samplerate;
 				devc->cur_pattern_mode_idx = PATTERN_MODE_NORMAL;
 				devc->capture_ratio = 10;
 				devc->voltage_threshold[0] =
@@ -521,18 +522,28 @@ static int config_set(uint32_t key, GVariant *data,
 	ret = SR_OK;
 	switch (key) {
 	case SR_CONF_SAMPLERATE:
-		if (g_variant_get_uint64(data) > devc->limit_samplerate ||
-		    std_u64_idx(data, devc->model->samplerate_table, devc->model->samplerate_table_size) < 0) {
-			devc->cur_samplerate = devc->limit_samplerate;
-			sr_warn("Reach limit or not supported, wrap to %" PRIu64 "MHz.",
+		if (std_u64_idx(data, devc->model->samplerate_table,
+				devc->model->samplerate_table_size) < 0) {
+			/* Not a rate this model has at all: nothing to defer. */
+			devc->req_samplerate = devc->cur_samplerate =
+				devc->limit_samplerate;
+			sr_warn("Not supported, wrap to %" PRIu64 "MHz.",
 				devc->limit_samplerate / SR_MHZ(1));
-		} else {
-			devc->cur_samplerate = g_variant_get_uint64(data);
-
-			if (devc->cur_samplerate > devc->limit_samplerate)
-				devc->cur_samplerate = devc->limit_samplerate;
+			break;
 		}
 
+		/*
+		 * Record the request even when it exceeds the ceiling for the
+		 * channel count selected right now; the channel count may still
+		 * come down and lift it. Do not warn here for that case - the
+		 * clamp is provisional, and acquisition start reports the rate
+		 * actually used once both settings are known.
+		 */
+		devc->req_samplerate = g_variant_get_uint64(data);
+		devc->cur_samplerate =
+			devc->req_samplerate > devc->limit_samplerate ?
+				devc->limit_samplerate :
+				devc->req_samplerate;
 		break;
 	case SR_CONF_NUM_LOGIC_CHANNELS:
 		if (std_i32_idx(data, devc->model->samplechannel_table, devc->model->samplechannel_table_size) < 0) {
@@ -547,8 +558,11 @@ static int config_set(uint32_t key, GVariant *data,
 					devc->model->samplechannel_table, devc->model->samplechannel_table_size)
 			];
 
-			if (devc->cur_samplerate > devc->limit_samplerate)
-				devc->cur_samplerate = devc->limit_samplerate;
+			/* Re-apply the ceiling to the request, which may now fit. */
+			devc->cur_samplerate =
+				devc->req_samplerate > devc->limit_samplerate ?
+					devc->limit_samplerate :
+					devc->req_samplerate;
 		}
 		// [en|dis]able channels and dbg
 		{
@@ -661,8 +675,17 @@ static int config_channel_set(const struct sr_dev_inst *sdi,
 				i32_idx(devc->cur_samplechannel,
 					devc->model->samplechannel_table, devc->model->samplechannel_table_size)
 			];
-		if (devc->cur_samplerate > devc->limit_samplerate)
-			devc->cur_samplerate = devc->limit_samplerate;
+		/*
+		 * Re-apply the ceiling to the requested rate rather than to the
+		 * clamped one. sigrok-cli sets --config before enabling
+		 * channels, so by the time a narrower mode is selected here the
+		 * rate has already been clamped against the wider mode's
+		 * ceiling; clamping the clamp could only ever ratchet downwards.
+		 */
+		devc->cur_samplerate =
+			devc->req_samplerate > devc->limit_samplerate ?
+				devc->limit_samplerate :
+				devc->req_samplerate;
 	}
 	return SR_OK;
 }
