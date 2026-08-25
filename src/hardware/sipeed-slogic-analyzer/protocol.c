@@ -622,6 +622,26 @@ SR_PRIV int sipeed_slogic_acquisition_start(const struct sr_dev_inst *sdi)
 		devc->stl = soft_trigger_logic_new(sdi, trigger, pre_trigger_samples);
 		if (!devc->stl)
 			return SR_ERR_MALLOC;
+
+		/*
+		 * soft_trigger_logic_new() sizes itself from the full channel
+		 * list, which is always 16 here, giving a unitsize of 2. Below
+		 * 16 active channels a sample is one byte, so both the unitsize
+		 * and the pre-trigger ring have to be corrected together.
+		 *
+		 * Correcting only the unitsize - as this driver used to - left
+		 * pre_trigger_size in bytes for the larger unit, so the ring
+		 * held twice the requested number of samples: a captureratio of
+		 * 25 placed the trigger at 50%, and 50 left no room for
+		 * post-trigger data at all, so the capture never triggered.
+		 *
+		 * The buffer itself is already allocated large enough; only the
+		 * bookkeeping shrinks.
+		 */
+		devc->stl->unitsize = (devc->cur_samplechannel + 7) / 8;
+		devc->stl->pre_trigger_size =
+			devc->stl->unitsize * pre_trigger_samples;
+
 		g_atomic_int_set(&devc->trigger_fired, FALSE);
 	}
 

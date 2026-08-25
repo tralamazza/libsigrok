@@ -912,8 +912,22 @@ SR_PRIV int slogic_soft_trigger_raw_data(void *data, size_t len,
 	// 					.data = ptr,
 	// 				} });
 
+	/*
+	 * From here on everything is counted in *session* bytes: one byte per
+	 * sample, after the sub-byte channel packing above has been expanded.
+	 *
+	 * The shared counters are in raw wire bytes - samples_need_nbytes is
+	 * cur_limit_samples * cur_samplechannel / 8, and the untriggered path
+	 * in handle_events() adds the pre-demux transfer length. The two units
+	 * coincide at 8 and 16 channels but differ by `expand` at 4, where the
+	 * device packs two samples per byte. Mixing them made acquisition stop
+	 * at half the requested sample count, which in turn aborted the run
+	 * before the trigger could fire.
+	 */
+	const uint64_t expand = (nCh < 8) ? 8 / nCh : 1;
+
+	/* stl->unitsize and its pre-trigger ring are set up in the caller. */
 	int pre_trigger_samples;
-	devc->stl->unitsize = uintsize;
 	int64_t trigger_offset = soft_trigger_logic_check(devc->stl, ptr, len, &pre_trigger_samples);
 	if (trigger_offset > -1) {
 		/* soft_trigger_logic_check() already sent the pre-trigger data. */
@@ -926,9 +940,11 @@ SR_PRIV int slogic_soft_trigger_raw_data(void *data, size_t len,
 		 * sample limit, so everything from the trigger on is wanted.
 		 */
 		if (devc->samples_need_nbytes) {
-			uint64_t sent = devc->samples_sent_nbytes + ret;
-			uint64_t need = devc->samples_need_nbytes > sent ?
-						devc->samples_need_nbytes - sent :
+			uint64_t need_session = devc->samples_need_nbytes * expand;
+			uint64_t sent_session =
+				devc->samples_sent_nbytes * expand + ret;
+			uint64_t need = need_session > sent_session ?
+						need_session - sent_session :
 						0;
 			if (remain > need)
 				remain = need;
@@ -952,8 +968,13 @@ SR_PRIV int slogic_soft_trigger_raw_data(void *data, size_t len,
 		 * merely gates transfer submission; letting it run on from
 		 * zero over-submits by at most one transfer, which the
 		 * limit check in handle_events() then discards.
+		 *
+		 * Convert back to raw wire bytes, rounding up so a partial
+		 * byte is never counted twice. Over-counting by at most one
+		 * byte per transfer ends acquisition marginally early, which
+		 * is safe; under-counting would overrun the sample limit.
 		 */
-		devc->samples_sent_nbytes += ret;
+		devc->samples_sent_nbytes += ((uint64_t)ret + expand - 1) / expand;
 	} else {
 		/*
 		 * Report "not triggered" distinctly. Returning the byte count
