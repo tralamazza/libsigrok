@@ -193,20 +193,10 @@ static gpointer libusb_event_thread_func(gpointer user_data)
 }
 
 /*
- * std_u64_idx() and std_i32_idx() do not take ownership of the GVariant
- * they are given, so handing them a freshly created one leaks it. Search
- * the tables directly instead.
+ * std_i32_idx() does not take ownership of the GVariant it is given, so
+ * handing it a freshly created one leaks it. Search the table directly
+ * instead.
  */
-static int u64_idx(uint64_t value, const uint64_t *arr, size_t n)
-{
-	for (size_t i = 0; i < n; i++) {
-		if (arr[i] == value)
-			return i;
-	}
-
-	return -1;
-}
-
 static int i32_idx(int32_t value, const int32_t *arr, size_t n)
 {
 	for (size_t i = 0; i < n; i++) {
@@ -651,7 +641,21 @@ static int config_channel_set(const struct sr_dev_inst *sdi,
 		}
 	}
 
-	if(new_samplechannel > devc->cur_samplechannel){
+	/*
+	 * Track the enabled channels in both directions, not just upwards.
+	 * SR_CONF_NUM_LOGIC_CHANNELS already rewrites ch->enabled to match the
+	 * count it is given, so the two are two views of one setting; letting
+	 * the channel list raise the count but never lower it made that
+	 * relationship asymmetric for no benefit. Disabling the upper channels
+	 * is how a frontend asks for a narrower, faster mode, and refusing to
+	 * lower the count left the samplerate ceiling pinned to the widest mode
+	 * ever selected.
+	 *
+	 * new_samplechannel is derived from the highest enabled channel index,
+	 * not from how many are enabled, so enabling only D0 and D15 still
+	 * selects the 16-channel mode.
+	 */
+	if (new_samplechannel != devc->cur_samplechannel) {
 		devc->cur_samplechannel = new_samplechannel;
 		devc->limit_samplerate = devc->model->limit_samplerate_table[
 				i32_idx(devc->cur_samplechannel,
@@ -697,10 +701,16 @@ static int config_list(uint32_t key, GVariant **data,
 					      drvopts, devopts);
 		break;
 	case SR_CONF_SAMPLERATE:
-		*data = std_gvar_samplerates(
-			devc->model->samplerate_table,
-			1 + u64_idx(devc->limit_samplerate,
-					devc->model->samplerate_table, devc->model->samplerate_table_size));
+		/*
+		 * The whole table, not the part reachable at the current
+		 * channel count. config_list() describes what the device can
+		 * do; the per-mode ceiling is dynamic and enforced by
+		 * config_set(), which warns when it clamps. Truncating here
+		 * made the advertised list depend on when it was asked, and
+		 * left no way to discover that a narrower mode goes faster.
+		 */
+		*data = std_gvar_samplerates(devc->model->samplerate_table,
+					     devc->model->samplerate_table_size);
 		break;
 	case SR_CONF_NUM_LOGIC_CHANNELS:
 		*data = std_gvar_array_i32(devc->model->samplechannel_table, devc->model->samplechannel_table_size);
